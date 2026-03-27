@@ -103,8 +103,6 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-This makes `import benchmark_rag` work from anywhere without `sys.path` hacks.
-
 ### 3. Set API keys
 
 ```bash
