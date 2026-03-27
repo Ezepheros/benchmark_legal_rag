@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "benchmark-rag"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "torch>=2.0",
+    "faiss-cpu>=1.7",
+    "tqdm>=4.0",
+    "psutil",
+    "pyarrow>=14.0",
+]
+
+[project.optional-dependencies]
+hf = ["transformers>=4.40", "sentence-transformers>=3.0", "tokenizers"]
+voyage = ["voyageai"]
+gemini = ["google-generativeai"]
+anthropic = ["anthropic"]
+openai = ["openai"]
+rerank = ["sentence-transformers>=3.0"]
+bm25 = ["rank-bm25"]
+dev = ["pytest", "pytest-cov", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["benchmark_rag*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

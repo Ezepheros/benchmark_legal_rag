@@ -1,0 +1,19 @@
+# Experiment: Qwen3-8B + recursive 1024-char chunking + 1000 docs
+base_config: ../../configs/base.yaml
+
+experiment_id: qwen_recursive_1024_1k
+description: "Qwen3-8B embedder, recursive 1024-char chunks, 1000-doc corpus"
+
+dataset:
+  max_docs: 1000
+
+chunker:
+  type: chunkers.recursive.RecursiveChunker
+  max_chunk_chars: 1024
+  overlap_chars: 128
+
+embedder:
+  type: embedders.qwen.QwenEmbedder
+  model_name: Qwen/Qwen3-Embedding-8B
+  device: cuda:0
+  batch_size: 16

@@ -1,0 +1,38 @@
+# PyTorch — install with the correct CUDA index URL, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Listed here without the URL so the file stays portable; override on install.
+torch>=2.2
+
+# FAISS (use faiss-gpu if installing via conda; faiss-cpu works on pip for CPU-only)
+faiss-cpu>=1.8
+
+# Core
+pydantic>=2.0
+python-dotenv
+pyyaml>=6.0
+numpy>=1.26
+pandas>=2.0
+pyarrow>=14.0
+tqdm
+psutil
+
+# HuggingFace (Qwen3)
+transformers>=4.45
+sentence-transformers>=3.0
+tokenizers
+huggingface-hub
+safetensors
+
+# Google (Gemini embedder, generator, judge)
+google-generativeai>=0.8
+
+# Isaacus Kanon2 (REST client)
+httpx>=0.27
+
+# Data utilities
+scikit-learn>=1.4
+fastparquet
+
+# Dev / testing
+pytest
+ruff

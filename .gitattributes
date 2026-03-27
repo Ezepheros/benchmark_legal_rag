@@ -1,0 +1,9 @@
+# Enforce Unix line endings for all text files.
+* text=auto eol=lf
+
+# Explicitly binary — never touch line endings
+*.parquet binary
+*.pkl     binary
+*.faiss   binary
+*.png     binary
+*.jpg     binary

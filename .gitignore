@@ -1,0 +1,32 @@
+# Virtual environment
+.venv/
+
+# Experiment outputs
+runs/
+
+# Data (symlink target is in its own repo)
+data/test_dataset
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+*.key
