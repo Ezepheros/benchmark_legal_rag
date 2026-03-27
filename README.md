@@ -110,7 +110,11 @@ export GOOGLE_API_KEY=...        # Gemini embedder, generator, judge
 export ISAACUS_API_KEY=...       # Kanon2 embedder
 ```
 
-### 4. Build the test dataset
+### 4. Place Dataset
+
+Move the dataset to 'data' folder
+
+OR
 
 Run `build_test_dataset.py` (one directory up) to produce the document corpus and query file:
 
