@@ -47,43 +47,29 @@ class SplitterConfig(ComponentConfig):
 
 
 class ChunkerConfig(ComponentConfig):
-    type: str = "chunkers.naive.NaiveChunker"
-    max_chunk_chars: int = 512
-    overlap_chars: int = 64
-    # SemanticChunker extras (ignored by NaiveChunker)
-    similarity_threshold: float = 0.6
-    max_chunk_chars_hard: int = 2048
-    splitter: SplitterConfig = Field(default_factory=SplitterConfig)
+    type: str = "chunkers.recursive.RecursiveChunker"
+    # All other fields (max_chunk_chars, overlap_chars, similarity_threshold, …)
+    # are passed through via model_extra — specify them directly in the YAML
+    # for whichever chunker type you are using.
 
 
 class EmbedderConfig(ComponentConfig):
-    type: str = "embedders.hf.HFEmbedder"
-    model_name: str = "Qwen/Qwen3-Embedding-0.6B"
-    device: str = "cuda:0"
-    batch_size: int = 32
+    type: str = "embedders.qwen.QwenEmbedder"
+    # All other fields (model_name, device, batch_size, …) are passed through
+    # via model_extra — specify them in the YAML for your chosen embedder.
 
 
 class RetrieverConfig(ComponentConfig):
     type: str = "retrievers.faiss_retriever.FaissRetriever"
-    metric: Literal["l2", "cosine"] = "cosine"
+    # Extra fields (e.g. metric) passed through via model_extra.
 
 
 class RerankerConfig(ComponentConfig):
     type: str = "rerankers.cross_encoder.CrossEncoderReranker"
-    model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    device: str = "cuda:0"
-    top_n: int = 10
 
 
 class GeneratorConfig(ComponentConfig):
-    type: str = "generators.anthropic.AnthropicGenerator"
-    model_name: str = "claude-sonnet-4-6"
-    max_tokens: int = 1024
-    temperature: float = 0.0
-    system_prompt: str = (
-        "You are a legal research assistant. Answer the question concisely and accurately "
-        "using only the provided context. Cite the relevant passage when possible."
-    )
+    type: str = "generators.gemini.GeminiGenerator"
 
 
 # ---------------------------------------------------------------------------
