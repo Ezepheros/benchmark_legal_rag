@@ -79,6 +79,10 @@ def setup_experiment_logging(
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
     root.handlers.clear()
 
+    # Silence chatty third-party loggers regardless of our level setting
+    for noisy in ("httpcore", "httpx", "urllib3", "filelock", "huggingface_hub"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     fmt = logging.Formatter(
         "%(asctime)s | %(name)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
