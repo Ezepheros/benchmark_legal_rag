@@ -135,8 +135,9 @@ class _JsonlHandler(logging.Handler):
         self._file = open(path, "a", encoding="utf-8")
 
     def emit(self, record: logging.LogRecord) -> None:
+        from datetime import datetime
         entry = {
-            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "ts": datetime.fromtimestamp(record.created).strftime("%Y-%m-%dT%H:%M:%S"),
             "experiment_id": self._experiment_id,
             "logger": record.name,
             "level": record.levelname,
