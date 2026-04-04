@@ -20,7 +20,6 @@ chunker:
 embedder:
   type: embedders.qwen.QwenEmbedder
   model_name: Qwen/Qwen3-Embedding-8B
-  device: cuda:0
   batch_size: 16
 
 retriever:

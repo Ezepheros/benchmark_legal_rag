@@ -39,6 +39,20 @@ from benchmark_rag.logging import setup_experiment_logging, get_logger
 from benchmark_rag.pipeline.rag_pipeline import RAGPipeline
 
 
+def _validate_api_keys(cfg: ExperimentConfig, args) -> None:
+    """Fail fast if required API keys are missing for the configured components."""
+    import os
+    embedder_type = cfg.embedder.type.lower()
+    generator_type = (cfg.generator.type.lower() if cfg.generator else "")
+
+    if "kanon2" in embedder_type and not os.environ.get("ISAACUS_API_KEY"):
+        sys.exit("ERROR: ISAACUS_API_KEY is not set. Required for Kanon2Embedder.")
+
+    needs_google = "gemini" in embedder_type or "gemini" in generator_type or args.iterretgen
+    if needs_google and not (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")):
+        sys.exit("ERROR: GOOGLE_API_KEY or GEMINI_API_KEY is not set. Required for Gemini components.")
+
+
 def load_queries(queries_path: str) -> list[dict]:
     """
     Load queries produced by build_test_dataset.py.
@@ -76,7 +90,7 @@ def _log_run_context(log, cfg: ExperimentConfig, config_source: str, args) -> No
     log.info(f"DESCRIPTION: {cfg.description}")
     log.info(f"SEED       : {cfg.seed}")
     log.info(f"CONFIG SRC : {config_source}")
-    log.info(f"FLAGS      : generate={args.generate}  judge={args.judge}")
+    log.info(f"FLAGS      : generate={args.generate}  judge={args.judge}  iterretgen={args.iterretgen}")
     log.info(f"INDEX ID   : {cfg.index_id}")
 
     # --- Input paths ---
@@ -92,7 +106,7 @@ def _log_run_context(log, cfg: ExperimentConfig, config_source: str, args) -> No
     log.info("--- components ---")
     log.info(f"  embedder : {cfg.embedder.type}")
     log.info(f"    model_name  : {cfg.embedder.model_name}")
-    log.info(f"    device      : {cfg.embedder.device}")
+    log.info(f"    device      : {cfg.embedder.model_extra.get('device', 'N/A')}")
     log.info(f"  chunker  : {cfg.chunker.type}")
     log.info(f"    max_chunk_chars : {cfg.chunker.max_chunk_chars}")
     log.info(f"    overlap_chars   : {cfg.chunker.overlap_chars}")
@@ -123,9 +137,12 @@ def main():
     parser.add_argument("--config", required=True, help="Path to experiment YAML config")
     parser.add_argument("--generate", action="store_true", help="Run answer generation")
     parser.add_argument("--judge", action="store_true", help="Run LLM judge on generated answers")
+    parser.add_argument("--iterretgen", action="store_true", help="Use IterRetGen pipeline (iterative retrieval augmented by intermediate generation)")
     args = parser.parse_args()
 
     cfg = ExperimentConfig.from_yaml(args.config)
+    _validate_api_keys(cfg, args)
+
     if cfg.evaluation is None:
         print("No evaluation config found — nothing to do.")
         sys.exit(1)
@@ -149,7 +166,10 @@ def main():
 
     # --- Build pipeline ---
     eval_cfg = cfg.evaluation
-    if args.generate and cfg.generator is not None:
+    if args.iterretgen:
+        from benchmark_rag.pipeline.iterretgen_pipeline import IterRetGenPipeline
+        pipeline = IterRetGenPipeline.from_config(cfg)
+    elif args.generate and cfg.generator is not None:
         pipeline = RAGPipeline.from_config(cfg)
     else:
         # Retrieval-only: build without generator
@@ -195,6 +215,10 @@ def main():
 
     elapsed = time.perf_counter() - t0
     log.info(f"Queried {len(rows)} examples in {elapsed:.1f}s")
+    if hasattr(pipeline, "log_usage_summary"):
+        pipeline.log_usage_summary()
+    elif pipeline.generator is not None and hasattr(pipeline.generator, "log_usage_summary"):
+        pipeline.generator.log_usage_summary()
 
     # --- Compute metrics ---
     eval_result: EvaluationResult = evaluate_retrieval(
@@ -223,6 +247,7 @@ def main():
                 if k != "rationale":
                     judge_scores.setdefault(k, []).append(float(v))
         eval_result.judge_scores = {k: sum(v) / len(v) for k, v in judge_scores.items() if v}
+        judge.log_usage_summary()
 
     # --- Save results ---
     results_file = results_dir / "query_results.jsonl"

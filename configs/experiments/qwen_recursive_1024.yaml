@@ -1,7 +1,7 @@
 # Experiment: Qwen3-8B + recursive 1024-char chunking + 1000 docs
 base_config: ../../configs/base.yaml
 
-experiment_id: qwen_recursive_1024_1k
+experiment_id: qwen_recursive_1024_1k-docs
 description: "Qwen3-8B embedder, recursive 1024-char chunks, 1000-doc corpus"
 
 dataset:
@@ -17,3 +17,20 @@ embedder:
   model_name: Qwen/Qwen3-Embedding-8B
   device: cuda:0
   batch_size: 16
+
+evaluation:
+  k_values: [3, 5, 10, 20, 50]
+  metrics:
+    - recall_at_k
+    - doc_recall_at_k
+    - hit_at_k
+    - mrr
+    - ndcg_at_k
+
+indexing:
+  document_batch_size: 10
+  embedding_batch_size: 16
+  save_intermediate_every: 50
+
+logging:
+  level: DEBUG

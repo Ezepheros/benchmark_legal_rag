@@ -72,6 +72,13 @@ class GeneratorConfig(ComponentConfig):
     type: str = "generators.gemini.GeminiGenerator"
 
 
+class IterRetGenConfig(BaseModel):
+    max_iterations: int = 3
+    short_answer: bool = True  # True = brief intermediate answers; False = full answers
+    intermediate_model_name: str = "gemini-2.5-flash"
+    intermediate_max_output_tokens: int = 200
+
+
 # ---------------------------------------------------------------------------
 # Dataset config
 # ---------------------------------------------------------------------------
@@ -141,6 +148,7 @@ class ExperimentConfig(BaseModel):
     retriever: RetrieverConfig = Field(default_factory=RetrieverConfig)
     reranker: RerankerConfig | None = None
     generator: GeneratorConfig | None = None
+    iterretgen: IterRetGenConfig | None = None
     evaluation: EvaluationConfig | None = None
     indexing: IndexingConfig = Field(default_factory=IndexingConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)

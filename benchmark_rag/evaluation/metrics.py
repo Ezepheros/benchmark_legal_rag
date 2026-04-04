@@ -24,9 +24,18 @@ from dataclasses import dataclass, field
 
 
 def recall_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:
+    """Chunk-level recall: counts each matching chunk separately (can exceed 1.0)."""
     if not relevant:
         return 0.0
     hits = sum(1 for r in retrieved[:k] if r in relevant)
+    return hits / len(relevant)
+
+
+def doc_recall_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:
+    """Document-level recall: deduplicates retrieved doc_ids before counting (always in [0, 1])."""
+    if not relevant:
+        return 0.0
+    hits = len(set(retrieved[:k]) & relevant)
     return hits / len(relevant)
 
 
@@ -110,7 +119,7 @@ def evaluate_retrieval(
         Defaults to all.
     """
     if metric_names is None:
-        metric_names = ["recall_at_k", "precision_at_k", "hit_at_k", "mrr", "ndcg_at_k"]
+        metric_names = ["recall_at_k", "doc_recall_at_k", "precision_at_k", "hit_at_k", "mrr", "ndcg_at_k"]
 
     n = len(retrieved_lists)
     assert n == len(relevant_sets), "retrieved_lists and relevant_sets must have the same length"
@@ -126,6 +135,8 @@ def evaluate_retrieval(
             for k in k_values:
                 if metric == "recall_at_k":
                     fn = recall_at_k
+                elif metric == "doc_recall_at_k":
+                    fn = doc_recall_at_k
                 elif metric == "precision_at_k":
                     fn = precision_at_k
                 elif metric == "hit_at_k":

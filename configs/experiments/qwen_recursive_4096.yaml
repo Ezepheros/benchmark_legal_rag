@@ -1,21 +1,20 @@
-# Smoke test — runs the full pipeline on 50 documents.
-# Uses the smallest Qwen model to keep it fast.
+# Experiment: Qwen3-8B + recursive 1024-char chunking + 1000 docs
 base_config: ../../configs/base.yaml
 
-experiment_id: smoke_test
-description: "End-to-end pipeline smoke test on 50 docs"
+experiment_id: qwen_recursive_4096_1k
+description: "Qwen3-8B embedder, recursive 4096-char chunks, 1000-doc corpus"
 
 dataset:
-  max_docs: 50
+  max_docs: 1000
 
 chunker:
   type: chunkers.recursive.RecursiveChunker
-  max_chunk_chars: 512
-  overlap_chars: 64
+  max_chunk_chars: 4096
+  overlap_chars: 128
 
 embedder:
   type: embedders.qwen.QwenEmbedder
-  model_name: Qwen/Qwen3-Embedding-0.6B
+  model_name: Qwen/Qwen3-Embedding-8B
   device: cuda:0
   batch_size: 16
 
@@ -34,4 +33,3 @@ indexing:
 
 logging:
   level: DEBUG
-  resource_monitor_interval: 0   # disabled for short runs

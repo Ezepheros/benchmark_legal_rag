@@ -1,8 +1,12 @@
 """Qwen3 embedding model via HuggingFace sentence-transformers."""
 from __future__ import annotations
 
+import logging
+
 import torch
 from benchmark_rag.components.base import BaseEmbedder
+
+log = logging.getLogger(__name__)
 
 
 class QwenEmbedder(BaseEmbedder):

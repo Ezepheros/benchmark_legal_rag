@@ -48,6 +48,24 @@ class FaissRetriever(BaseRetriever):
 
         self._index.add(emb)
 
+    def add_chunks(self, chunks: list[EmbeddedChunk]) -> None:
+        """
+        Append new EmbeddedChunks to an already-loaded index.
+        Requires build_index() or load_index() to have been called first.
+        """
+        if self._index is None:
+            raise RuntimeError("No index loaded. Call build_index() or load_index() first.")
+        if not chunks:
+            return
+
+        import faiss
+
+        emb = np.array([c.embedding for c in chunks], dtype="float32")
+        if self.metric == "cosine":
+            faiss.normalize_L2(emb)
+        self._index.add(emb)
+        self._chunks.extend(chunks)
+
     def save_index(self, path: str | Path) -> None:
         import faiss
         import pickle

@@ -32,6 +32,18 @@ from benchmark_rag.logging import setup_experiment_logging, get_logger
 from benchmark_rag.pipeline.indexing_pipeline import IndexingPipeline
 
 
+def _validate_api_keys(cfg: ExperimentConfig) -> None:
+    """Fail fast if required API keys are missing for the configured components."""
+    import os
+    embedder_type = cfg.embedder.type.lower()
+
+    if "kanon2" in embedder_type and not os.environ.get("ISAACUS_API_KEY"):
+        sys.exit("ERROR: ISAACUS_API_KEY is not set. Required for Kanon2Embedder.")
+
+    if "gemini" in embedder_type and not (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")):
+        sys.exit("ERROR: GOOGLE_API_KEY or GEMINI_API_KEY is not set. Required for GeminiEmbedder.")
+
+
 def load_documents(cfg: ExperimentConfig):
     """
     Load documents from the dataset path specified in the config.
@@ -134,7 +146,7 @@ def _log_run_context(log, cfg: ExperimentConfig, config_source: str) -> None:
     log.info(f"    overlap_chars   : {cfg.chunker.overlap_chars}")
     log.info(f"  embedder : {cfg.embedder.type}")
     log.info(f"    model_name      : {cfg.embedder.model_name}")
-    log.info(f"    device          : {cfg.embedder.device}")
+    log.info(f"    device          : {cfg.embedder.model_extra.get('device', 'N/A')}")
     log.info(f"    batch_size      : {cfg.embedder.batch_size}")
     log.info(f"  retriever: {cfg.retriever.type}")
     log.info(f"    metric          : {cfg.retriever.model_extra.get('metric', 'cosine')}")
@@ -151,12 +163,6 @@ def _log_run_context(log, cfg: ExperimentConfig, config_source: str) -> None:
     log.info("=" * 60)
 
 
-def _index_exists(cfg: ExperimentConfig) -> bool:
-    """Return True if a complete index already exists for this config."""
-    index_dir = Path(cfg.indexing.output_dir)
-    return (index_dir / "index.faiss").exists() and (index_dir / "index.chunks.pkl").exists()
-
-
 def main():
     parser = argparse.ArgumentParser(description="Run indexing pipeline for one experiment.")
     parser.add_argument("--config", required=True, help="Path to experiment YAML config")
@@ -168,6 +174,7 @@ def main():
     args = parser.parse_args()
 
     cfg = ExperimentConfig.from_yaml(args.config)
+    _validate_api_keys(cfg)
 
     setup_experiment_logging(
         experiment_id=cfg.experiment_id,
@@ -179,17 +186,10 @@ def main():
     _log_run_context(log, cfg, config_source=args.config)
     log.info(f"Index ID: {cfg.index_id}")
 
-    if _index_exists(cfg) and not args.force_reindex:
-        log.info(
-            f"Index already exists at {cfg.indexing.output_dir} — skipping indexing. "
-            "Pass --force-reindex to rebuild."
-        )
-        return
-
     documents = load_documents(cfg)
     log.info(f"Loaded {len(documents)} documents from {cfg.dataset.path}")
 
-    pipeline = IndexingPipeline(cfg)
+    pipeline = IndexingPipeline(cfg, force_reindex=args.force_reindex)
     output_dir = pipeline.run(documents)
     log.info(f"Indexing complete. Output: {output_dir}")
 

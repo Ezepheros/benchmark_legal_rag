@@ -1,8 +1,8 @@
-# Experiment: Kanon2 (legal-domain) + recursive 1024-char chunking + 1000 docs
+# Experiment: Gemini embedding + recursive 1024-char chunking + 1000 docs
 base_config: ../../configs/base.yaml
 
-experiment_id: kanon2_recursive_1024_1k-docs
-description: "Kanon2 legal embedder, recursive 1024-char chunks, 1000-doc corpus"
+experiment_id: gemini_recursive_1024_1k-docs
+description: "Gemini embedder, recursive 1024-char chunks, 1000-doc corpus"
 
 dataset:
   max_docs: 1000
@@ -13,9 +13,10 @@ chunker:
   overlap_chars: 128
 
 embedder:
-  type: embedders.kanon2.Kanon2Embedder
-  model_name: kanon-2-embedder
-  batch_size: 64
+  type: embedders.gemini.GeminiEmbedder
+  model_name: gemini-embedding-001
+  task_type: RETRIEVAL_DOCUMENT
+  batch_size: 50
   max_cost_usd: 10.0
 
 evaluation:
@@ -29,7 +30,7 @@ evaluation:
 
 indexing:
   document_batch_size: 10
-  embedding_batch_size: 64
+  embedding_batch_size: 50
   save_intermediate_every: 50
 
 logging:

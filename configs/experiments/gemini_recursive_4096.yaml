@@ -14,6 +14,7 @@ chunker:
 
 embedder:
   type: embedders.gemini.GeminiEmbedder
-  model_name: models/gemini-embedding-exp-03-07
+  model_name: gemini-embedding-001
   task_type: RETRIEVAL_DOCUMENT
   batch_size: 50
+  max_cost_usd: 10.0

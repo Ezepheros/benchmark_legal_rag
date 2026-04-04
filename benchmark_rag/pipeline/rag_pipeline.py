@@ -75,7 +75,14 @@ class RAGPipeline:
         """
         from benchmark_rag.components.retrievers.faiss_retriever import FaissRetriever
 
-        embedder: BaseEmbedder = build_from_component_config(cfg.embedder.to_build_dict())
+        # Build embedder for query-time — switch task type for API embedders that
+        # distinguish document vs. query encoding (Gemini, Kanon2).
+        embedder_cfg = cfg.embedder.to_build_dict()
+        if "task_type" in embedder_cfg:
+            embedder_cfg["task_type"] = "RETRIEVAL_QUERY"
+        if "task" in embedder_cfg:
+            embedder_cfg["task"] = "retrieval/query"
+        embedder: BaseEmbedder = build_from_component_config(embedder_cfg)
 
         retriever = FaissRetriever(metric=cfg.retriever.model_extra.get("metric", "cosine"))
         index_path = Path(cfg.indexing.output_dir) / "index"
