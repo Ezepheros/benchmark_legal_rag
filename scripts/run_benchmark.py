@@ -44,11 +44,18 @@ def _validate_api_keys(cfg: ExperimentConfig, args) -> None:
     import os
     embedder_type = cfg.embedder.type.lower()
     generator_type = (cfg.generator.type.lower() if cfg.generator else "")
+    reranker_type = (cfg.reranker.type.lower() if cfg.reranker else "")
 
-    if "kanon2" in embedder_type and not os.environ.get("ISAACUS_API_KEY"):
-        sys.exit("ERROR: ISAACUS_API_KEY is not set. Required for Kanon2Embedder.")
+    needs_isaacus = "kanon2" in embedder_type or "kanon2" in reranker_type
+    if needs_isaacus and not os.environ.get("ISAACUS_API_KEY"):
+        sys.exit("ERROR: ISAACUS_API_KEY is not set. Required for Kanon2Embedder / Kanon2Reranker.")
 
-    needs_google = "gemini" in embedder_type or "gemini" in generator_type or args.iterretgen
+    needs_google = (
+        "gemini" in embedder_type
+        or "gemini" in generator_type
+        or args.iterretgen
+        or cfg.agentic is not None
+    )
     if needs_google and not (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")):
         sys.exit("ERROR: GOOGLE_API_KEY or GEMINI_API_KEY is not set. Required for Gemini components.")
 
@@ -166,9 +173,18 @@ def main():
 
     # --- Build pipeline ---
     eval_cfg = cfg.evaluation
+    is_agentic = cfg.agentic is not None
+    is_hybrid = "hybrid" in cfg.retriever.type.lower()
+
     if args.iterretgen:
         from benchmark_rag.pipeline.iterretgen_pipeline import IterRetGenPipeline
         pipeline = IterRetGenPipeline.from_config(cfg)
+    elif is_agentic:
+        from benchmark_rag.pipeline.agentic_pipeline import AgenticRAGPipeline
+        pipeline = AgenticRAGPipeline.from_config(cfg)
+    elif is_hybrid:
+        from benchmark_rag.pipeline.hybrid_pipeline import HybridRAGPipeline
+        pipeline = HybridRAGPipeline.from_config(cfg)
     elif args.generate and cfg.generator is not None:
         pipeline = RAGPipeline.from_config(cfg)
     else:
@@ -217,7 +233,7 @@ def main():
     log.info(f"Queried {len(rows)} examples in {elapsed:.1f}s")
     if hasattr(pipeline, "log_usage_summary"):
         pipeline.log_usage_summary()
-    elif pipeline.generator is not None and hasattr(pipeline.generator, "log_usage_summary"):
+    if hasattr(pipeline, "generator") and pipeline.generator is not None and hasattr(pipeline.generator, "log_usage_summary"):
         pipeline.generator.log_usage_summary()
 
     # --- Compute metrics ---

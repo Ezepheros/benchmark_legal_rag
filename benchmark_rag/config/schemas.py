@@ -79,6 +79,13 @@ class IterRetGenConfig(BaseModel):
     intermediate_max_output_tokens: int = 200
 
 
+class AgenticConfig(BaseModel):
+    max_iterations: int = 5          # hard cap on tool-call rounds before forcing a final answer
+    max_k_per_search: int = 10       # upper bound on k per single keyword_search call
+    max_doc_chunks: int = 15         # upper bound on chunks returned by a single get_document call
+    model_name: str = "gemini-2.5-flash"
+
+
 # ---------------------------------------------------------------------------
 # Dataset config
 # ---------------------------------------------------------------------------
@@ -149,6 +156,7 @@ class ExperimentConfig(BaseModel):
     reranker: RerankerConfig | None = None
     generator: GeneratorConfig | None = None
     iterretgen: IterRetGenConfig | None = None
+    agentic: AgenticConfig | None = None
     evaluation: EvaluationConfig | None = None
     indexing: IndexingConfig = Field(default_factory=IndexingConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
