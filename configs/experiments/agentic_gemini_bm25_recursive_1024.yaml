@@ -1,0 +1,70 @@
+# Experiment: Agentic retrieval — Gemini LLM iteratively searches a BM25 index
+# using keyword_search and get_document tools, then synthesises a final answer.
+#
+# Index sharing: this config uses the same dataset + chunker + embedder settings
+# as hybrid_bm25_qwen_kanon2rerank_recursive_1024, so if that index already exists
+# at runs/indexes/{index_id}/, no re-indexing is needed.
+#
+# If indexing from scratch, run:
+#   python scripts/run_indexing.py --config configs/experiments/agentic_gemini_bm25_recursive_1024.yaml
+#
+# Then evaluate:
+#   python scripts/run_benchmark.py --config configs/experiments/agentic_gemini_bm25_recursive_1024.yaml
+#
+# Requires: GOOGLE_API_KEY or GEMINI_API_KEY (for Gemini agent)
+#           ISAACUS_API_KEY is NOT required — no Kanon2 components are used at query time.
+
+base_config: ../../configs/base.yaml
+
+experiment_id: agentic_gemini_bm25_recursive_1024_1k-docs
+description: "Agentic retrieval: Gemini LLM drives BM25 keyword search iteratively, recursive 1024-char chunks, 1000-doc corpus"
+
+dataset:
+  max_docs: 1000
+
+chunker:
+  type: chunkers.recursive.RecursiveChunker
+  max_chunk_chars: 1024
+  overlap_chars: 128
+
+# Embedder used only during indexing to produce EmbeddedChunk objects.
+# The agentic pipeline does not call the embedder at query time.
+# Must match the hybrid experiment settings so the index_id (and therefore
+# the on-disk index path) is identical.
+embedder:
+  type: embedders.qwen.QwenEmbedder
+  model_name: Qwen/Qwen3-Embedding-8B
+  device: cuda:0
+  batch_size: 16
+
+# HybridRetriever builds both FAISS and BM25 indexes during run_indexing.py.
+# The agentic pipeline loads only the BM25 index (.bm25.pkl) at query time.
+retriever:
+  type: retrievers.hybrid_retriever.HybridRetriever
+  metric: cosine
+  bm25_k1: 1.5
+  bm25_b: 0.75
+
+# Agentic pipeline config — controls the agent loop
+agentic:
+  max_iterations: 5       # tool-call rounds before forcing a final answer
+  max_k_per_search: 10    # max chunks per single keyword_search call
+  max_doc_chunks: 15      # max chunks per single get_document call
+  model_name: gemini-2.5-flash
+
+evaluation:
+  k_values: [3, 5, 10, 20, 50]
+  metrics:
+    - recall_at_k
+    - doc_recall_at_k
+    - hit_at_k
+    - mrr
+    - ndcg_at_k
+
+indexing:
+  document_batch_size: 10
+  embedding_batch_size: 16
+  save_intermediate_every: 50
+
+logging:
+  level: DEBUG
