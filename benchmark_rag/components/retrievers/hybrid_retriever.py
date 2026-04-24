@@ -25,7 +25,7 @@ from pathlib import Path
 
 import logging
 
-from benchmark_rag.components.base import BaseRetriever, EmbeddedChunk, RetrievedChunk
+from benchmark_rag.components.base import BaseRetriever, Document, EmbeddedChunk, RetrievedChunk
 from benchmark_rag.components.retrievers.bm25_retriever import BM25Retriever
 from benchmark_rag.components.retrievers.faiss_retriever import FaissRetriever
 
@@ -114,9 +114,15 @@ class HybridRetriever(BaseRetriever):
     metric:
         FAISS distance metric: "cosine" (default) or "l2".
     bm25_k1:
-        BM25 term-frequency saturation parameter (default 1.5).
+        BM25L term-frequency saturation parameter (default 1.5).
     bm25_b:
-        BM25 length-normalisation parameter (default 0.75).
+        BM25L length-normalisation parameter (default 0.75).
+    bm25_delta:
+        BM25L lower-bound on normalised TF (default 0.5).
+    bm25_index_level:
+        "chunk" (default) — BM25 indexes individual chunks.
+        "document" — BM25 indexes full documents; results are expanded to
+        chunks at retrieval time using the stored doc_id → chunks mapping.
     rrf_k:
         RRF constant used in retrieve_hybrid fallback (default 60).
     faiss_candidates:
@@ -131,6 +137,8 @@ class HybridRetriever(BaseRetriever):
         metric: str = "cosine",
         bm25_k1: float = 1.5,
         bm25_b: float = 0.75,
+        bm25_delta: float = 0.5,
+        bm25_index_level: str = "chunk",
         rrf_k: int = 60,
         faiss_candidates: int | None = None,
         bm25_candidates: int | None = None,
@@ -140,7 +148,8 @@ class HybridRetriever(BaseRetriever):
         self._faiss_candidates = faiss_candidates
         self._bm25_candidates = bm25_candidates
         self._faiss = FaissRetriever(metric=metric)
-        self._bm25 = BM25Retriever(k1=bm25_k1, b=bm25_b)
+        self._bm25 = BM25Retriever(k1=bm25_k1, b=bm25_b, delta=bm25_delta,
+                                    index_level=bm25_index_level)
 
     # ------------------------------------------------------------------
     # Expose FAISS internals so IndexingPipeline can inspect them
@@ -159,17 +168,32 @@ class HybridRetriever(BaseRetriever):
     # Index management
     # ------------------------------------------------------------------
 
-    def build_index(self, chunks: list[EmbeddedChunk]) -> None:
+    def build_index(
+        self,
+        chunks: list[EmbeddedChunk],
+        documents: list["Document"] | None = None,
+    ) -> None:
         """Build both FAISS (dense) and BM25 (sparse) indexes."""
         self._faiss.build_index(chunks)
-        self._bm25.build_index(chunks)
+        self._bm25.build_index(chunks, documents=documents)
 
     def add_chunks(self, chunks: list[EmbeddedChunk]) -> None:
         """
         Extend the FAISS index incrementally and rebuild BM25 from all chunks
         (rank-bm25 has no incremental add path).
+
+        Note: document-level BM25 falls back to chunk-level rebuild here
+        because the original Document objects are not available at incremental-
+        add time.  Re-run full indexing to get a true document-level BM25 index.
         """
         self._faiss.add_chunks(chunks)
+        if self._bm25.index_level == "document":
+            log.warning(
+                "Incremental add with document-level BM25: falling back to "
+                "chunk-level rebuild (original documents not available). "
+                "Re-run full indexing for a true document-level BM25 index."
+            )
+            self._bm25.index_level = "chunk"
         self._bm25.build_index(self._faiss._chunks)
 
     def save_index(self, path: str | Path) -> None:
@@ -179,11 +203,12 @@ class HybridRetriever(BaseRetriever):
         Written files:
             <path>.faiss          — FAISS flat index vectors
             <path>.chunks.pkl     — serialised EmbeddedChunk list (shared)
-            <path>.bm25.pkl       — BM25 model + chunks
+            <path>.bm25.pkl       — BM25 chunk-level index (when index_level="chunk")
+            <path>.bm25_doc.pkl   — BM25 document-level index (when index_level="document")
         """
         path = Path(path)
         self._faiss.save_index(path)  # writes .faiss + .chunks.pkl
-        self._bm25.save_index(path)   # writes .bm25.pkl
+        self._bm25.save_index(path)   # writes .bm25.pkl or .bm25_doc.pkl
 
     def load_index(self, path: str | Path) -> None:
         """
@@ -191,26 +216,52 @@ class HybridRetriever(BaseRetriever):
 
         If the BM25 index file does not exist (e.g. the index was originally
         built by a non-hybrid run using the same dataset+chunker+embedder), it
-        is rebuilt from the FAISS chunks already in memory and saved immediately
-        so subsequent loads are fast.
+        is rebuilt at chunk level from the FAISS chunks already in memory and
+        saved immediately so subsequent loads are fast.  Document-level BM25
+        requires the index to have been built during indexing.
         """
         path = Path(path)
         self._faiss.load_index(path)
-        bm25_path = path.with_suffix(".bm25.pkl")
-        if bm25_path.exists():
+        bm25_pkl = path.parent / (path.stem + self._bm25._bm25_suffix())
+        if bm25_pkl.exists():
             self._bm25.load_index(path)
         else:
+            if self._bm25.index_level == "document":
+                log.warning(
+                    "BM25 document-level index not found at %s — "
+                    "falling back to chunk-level rebuild (original documents not "
+                    "available). Re-run full indexing for document-level BM25.",
+                    bm25_pkl,
+                )
+                self._bm25.index_level = "chunk"
+            bm25_pkl = path.parent / (path.stem + self._bm25._bm25_suffix())
             log.info(
                 "BM25 index not found at %s — rebuilding from %d FAISS chunks.",
-                bm25_path, len(self._faiss._chunks),
+                bm25_pkl, len(self._faiss._chunks),
             )
             self._bm25.build_index(self._faiss._chunks)
             self._bm25.save_index(path)
-            log.info("BM25 index saved to %s", bm25_path)
+            log.info("BM25 index saved to %s", bm25_pkl)
 
     # ------------------------------------------------------------------
     # Retrieval
     # ------------------------------------------------------------------
+
+    def _expand_doc_results(self, doc_results: list[RetrievedChunk]) -> list[RetrievedChunk]:
+        """Expand document-level BM25 results to their constituent chunks."""
+        expanded: list[RetrievedChunk] = []
+        for doc_result in doc_results:
+            doc_chunks = self._bm25._doc_chunk_lookup.get(doc_result.doc_id, [])
+            for c in doc_chunks:
+                expanded.append(RetrievedChunk(
+                    text=c.text,
+                    doc_id=c.doc_id,
+                    chunk_idx=c.chunk_idx,
+                    metadata=c.metadata,
+                    embedding=c.embedding,
+                    score=doc_result.score,
+                ))
+        return expanded
 
     def retrieve_candidates(
         self,
@@ -227,6 +278,9 @@ class HybridRetriever(BaseRetriever):
         will score every candidate against the raw query text and return a
         properly ranked list.
 
+        When BM25 is in document-level mode, each BM25 result is expanded to
+        all its chunks before merging with FAISS results.
+
         Parameters
         ----------
         n_faiss:
@@ -239,6 +293,10 @@ class HybridRetriever(BaseRetriever):
 
         faiss_results = self._faiss.retrieve(query_embedding, k=n_faiss)
         bm25_results = self._bm25.retrieve_text(query_text, k=n_bm25)
+
+        if self._bm25.index_level == "document":
+            bm25_results = self._expand_doc_results(bm25_results)
+
         return _merge_candidates(faiss_results, bm25_results)
 
     def retrieve_hybrid(
@@ -252,12 +310,16 @@ class HybridRetriever(BaseRetriever):
 
         Fetches candidates from both sub-retrievers and fuses their ranked
         lists with Reciprocal Rank Fusion, returning the top-k results.
+        When BM25 is document-level, results are expanded to chunks first.
         """
         n_faiss = self._faiss_candidates or k * 2
         n_bm25 = self._bm25_candidates or k * 2
 
         faiss_results = self._faiss.retrieve(query_embedding, k=n_faiss)
         bm25_results = self._bm25.retrieve_text(query_text, k=n_bm25)
+
+        if self._bm25.index_level == "document":
+            bm25_results = self._expand_doc_results(bm25_results)
 
         fused = _rrf_fuse([faiss_results, bm25_results], rrf_k=self.rrf_k)
         return fused[:k]

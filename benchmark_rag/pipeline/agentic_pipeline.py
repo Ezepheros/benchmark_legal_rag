@@ -1,36 +1,42 @@
 """
-Agentic RAG pipeline: an LLM iteratively searches a BM25 index using keyword
-tools, then synthesises a final answer from the accumulated passages.
+Agentic RAG pipeline: a Gemini LLM drives iterative keyword search over a
+BM25 index, explicitly curating relevant documents before synthesising a
+final answer.
 
-Two tools are available to the agent:
+The agent alternates between two phases each iteration:
 
-  keyword_search(query, k)
-      BM25 search over all indexed chunks.  Analogous to grep — the agent
-      picks the search terms and refines them across iterations.
+  Search phase  — tools: keyword_search, answer
+    The agent searches for cases using BM25 keywords, or calls answer()
+    if it already has enough saved documents.
 
-  get_document(citation, max_chunks)
-      Returns all chunks for a specific case in document order, up to
-      max_chunks.  Analogous to cat — drill into a case the agent already
-      identified as relevant.
-      # TODO: add pagination support (page parameter, return max_chunks per
-      #       page) so very long cases can be browsed incrementally.
+  Review phase  — tools: save_citations, answer
+    After seeing the search results, the agent saves the relevant citations
+    (with search-term provenance) or calls answer() to stop searching.
 
-The agent loop uses Gemini's native function-calling API.  The conversation
-history grows each iteration, giving the LLM full context of what it has
-already found before deciding what to search for next.
+Each save_citations response includes a full state summary (saved documents +
+queries run so far), giving the agent full context before the next search.
+
+Three tools:
+  keyword_search(query, k)   BM25 search; available in search phase only.
+  save_citations(citations)  Save relevant citations; available in review phase only.
+  answer()                   Exit signal; available in both phases.
+
+When answer() is called (or max_iterations is exhausted), a separate final-
+answer generation step is performed with all saved document chunks as context
+and no tools.
 
 Usage
 -----
-    python scripts/run_benchmark.py \
+    python scripts/run_benchmark.py \\
         --config configs/experiments/agentic_gemini_bm25_recursive_1024.yaml
 
 Requires: GOOGLE_API_KEY or GEMINI_API_KEY environment variable.
-Requires a pre-built BM25 index (run run_indexing.py with a HybridRetriever
-or BM25Retriever config that matches the dataset + chunker + embedder settings).
+Requires a pre-built BM25 index (run run_indexing.py first).
 """
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 from benchmark_rag.components.base import EmbeddedChunk, RetrievedChunk
@@ -38,41 +44,24 @@ from benchmark_rag.components.retrievers.bm25_retriever import BM25Retriever
 from benchmark_rag.config.schemas import ExperimentConfig
 from benchmark_rag.logging import get_logger
 from benchmark_rag.pipeline.rag_pipeline import QueryResult
+from benchmark_rag.prompts.agentic import (
+    ANSWER_SYSTEM_PROMPT as _ANSWER_SYSTEM_PROMPT,
+    REVIEW_SYSTEM_PROMPT as _REVIEW_SYSTEM_PROMPT,
+    SEARCH_SYSTEM_PROMPT as _SEARCH_SYSTEM_PROMPT,
+)
 
 log = logging.getLogger(__name__)
 
-# Per-token pricing for cost tracking
 _PRICING: dict[str, tuple[float, float]] = {
-    "gemini-2.5-flash": (0.075 / 1_000_000, 0.30 / 1_000_000),
-    "gemini-2.5-pro":   (1.25  / 1_000_000, 10.0  / 1_000_000),
-    "gemini-2.0-flash": (0.10  / 1_000_000, 0.40  / 1_000_000),
+    "gemini-2.5-flash": (0.3 / 1_000_000, 2.5 / 1_000_000),
+    "gemini-2.5-pro":   (1.25 / 1_000_000, 10.0 / 1_000_000),
 }
 
-_SYSTEM_PROMPT = """\
-You are a legal research assistant with access to a searchable database of Canadian legal cases.
-
-You have two search tools:
-
-keyword_search(query, k)
-  Search the database for text passages matching the given keywords (BM25 ranking).
-  Results show the case citation and the matching passage.
-  Use this to discover which cases are relevant to the question.
-
-get_document(citation, max_chunks)
-  Retrieve passages from a specific case in document order.
-  Use this after keyword_search has identified a promising case.
-
-Strategy:
-1. Begin with keyword_search using key legal terms from the question.
-2. When results mention a promising case, use get_document to read more of it.
-3. Refine your searches based on what you find — try different terminology, narrower \
-terms, or related legal concepts.
-4. When you have enough context to answer the question accurately, stop searching \
-and write your answer.
-
-Answer concisely and accurately. Cite relevant cases by their citation when possible.
-If the database does not contain sufficient information to answer the question, say so clearly.\
-"""
+@dataclass
+class _SavedDoc:
+    citation: str
+    search_query: str       # the keyword_search query that led to saving this document
+    chunks: list[RetrievedChunk]
 
 
 def _estimate_cost(model_name: str, in_tok: int, out_tok: int) -> float | None:
@@ -94,25 +83,23 @@ def _format_chunks(chunks: list[RetrievedChunk], show_score: bool = True) -> str
 
 class AgenticRAGPipeline:
     """
-    RAG pipeline where a Gemini LLM iteratively drives keyword search over a
-    BM25 index, accumulating retrieved chunks across iterations before
-    producing a final answer.
+    RAG pipeline where a Gemini LLM alternates between a search phase and a
+    review phase to iteratively curate relevant documents from a BM25 index
+    before synthesising a final answer.
 
     Parameters
     ----------
     retriever:
-        Pre-loaded BM25Retriever.  The pipeline also builds an internal
-        doc_id → chunks lookup for efficient get_document calls.
+        Pre-loaded BM25Retriever.
     model_name:
-        Gemini model ID used for both the agent loop and final answer.
+        Gemini model ID used for all agent calls and the final answer.
     max_iterations:
-        Hard cap on the number of tool-call rounds.  If the LLM has not
-        produced a text answer by this point, a final answer is forced.
+        Hard cap on search→review iteration rounds.  If the LLM has not
+        called answer() by this point, final answer generation is forced.
     max_k_per_search:
-        Upper bound on k for a single keyword_search call (guards against
-        the agent requesting enormous result sets).
+        Upper bound on k for a single keyword_search call.
     max_doc_chunks:
-        Upper bound on chunks returned by a single get_document call.
+        Upper bound on chunks loaded per saved document (get_document style).
     api_key:
         Google API key.  Falls back to GOOGLE_API_KEY / GEMINI_API_KEY env vars.
     """
@@ -136,13 +123,11 @@ class AgenticRAGPipeline:
         self._doc_chunks: dict[str, list[EmbeddedChunk]] = {}
         self.log = get_logger(__name__)
 
-        # Cost tracking
         self._call_count: int = 0
         self._total_input_tokens: int = 0
         self._total_output_tokens: int = 0
         self._total_cost: float | None = None
 
-        # Build doc_id → sorted chunk list once at construction
         self._build_doc_lookup()
 
     def _build_doc_lookup(self) -> None:
@@ -157,7 +142,11 @@ class AgenticRAGPipeline:
         import os
         from google import genai
 
-        key = self._api_key or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        key = (
+            self._api_key
+            or os.environ.get("GOOGLE_API_KEY")
+            or os.environ.get("GEMINI_API_KEY")
+        )
         if not key:
             raise EnvironmentError(
                 "No Google API key found. Set GOOGLE_API_KEY or GEMINI_API_KEY, "
@@ -204,23 +193,104 @@ class AgenticRAGPipeline:
             return "No results found for the given query.", []
         return _format_chunks(chunks, show_score=True), chunks
 
-    def _get_document(self, citation: str, max_chunks: int) -> tuple[str, list[RetrievedChunk]]:
-        max_chunks = min(max_chunks, self._max_doc_chunks)
-        self.log.debug(
-            "AgenticRAGPipeline tool=get_document citation=%r max_chunks=%d",
-            citation, max_chunks,
-        )
-        raw = self._doc_chunks.get(citation.strip(), [])
-        if not raw:
-            return f"No document found with citation '{citation}'.", []
-        chunks = [
-            RetrievedChunk(
-                text=c.text, doc_id=c.doc_id, chunk_idx=c.chunk_idx,
-                metadata=c.metadata, embedding=c.embedding, score=0.0,
+    def _save_citations(
+        self,
+        citations: list[str],
+        search_query: str,
+        saved_docs: dict[str, _SavedDoc],
+    ) -> str:
+        """
+        Record citations as relevant, loading their chunks from the BM25 index.
+        Skips citations already saved.  Returns a confirmation string.
+        """
+        saved_new: list[str] = []
+        not_found: list[str] = []
+
+        for citation in citations:
+            citation = citation.strip()
+            if not citation or citation in saved_docs:
+                continue
+            raw = self._doc_chunks.get(citation, [])
+            if not raw:
+                self.log.warning(
+                    "AgenticRAGPipeline save_citations: no chunks for citation %r", citation
+                )
+                not_found.append(citation)
+                continue
+            chunks = [
+                RetrievedChunk(
+                    text=c.text,
+                    doc_id=c.doc_id,
+                    chunk_idx=c.chunk_idx,
+                    metadata=c.metadata,
+                    embedding=c.embedding,
+                    score=0.0,
+                )
+                for c in raw[: self._max_doc_chunks]
+            ]
+            saved_docs[citation] = _SavedDoc(
+                citation=citation,
+                search_query=search_query,
+                chunks=chunks,
             )
-            for c in raw[:max_chunks]
-        ]
-        return _format_chunks(chunks, show_score=False), chunks
+            saved_new.append(citation)
+
+        parts: list[str] = []
+        if saved_new:
+            parts.append(f"Saved {len(saved_new)} citation(s): {', '.join(saved_new)}.")
+        if not_found:
+            parts.append(
+                f"Not found in database (check spelling): {', '.join(not_found)}."
+            )
+        if not parts:
+            parts.append(
+                "No new citations saved (all were already saved or list was empty)."
+            )
+        return " ".join(parts)
+
+    # ------------------------------------------------------------------
+    # State formatting helpers
+    # ------------------------------------------------------------------
+
+    def _format_state(
+        self,
+        saved_docs: dict[str, _SavedDoc],
+        searches_run: list[str],
+    ) -> str:
+        """
+        Compact state summary injected into save_citations responses so the
+        agent has full context before choosing the next search.
+        """
+        lines: list[str] = ["=== Research State ==="]
+
+        if searches_run:
+            lines.append(
+                "Searches run: " + " | ".join(f'"{s}"' for s in searches_run)
+            )
+        else:
+            lines.append("No searches run yet.")
+
+        if saved_docs:
+            lines.append(f"\nSaved documents ({len(saved_docs)}):")
+            for doc in saved_docs.values():
+                lines.append(f"\n[{doc.citation}]  (found via: \"{doc.search_query}\")")
+                # Show first chunk truncated so the agent can remember what each doc is
+                if doc.chunks:
+                    snippet = doc.chunks[0].text[:300].replace("\n", " ")
+                    lines.append(f"  {snippet}...")
+        else:
+            lines.append("\nNo documents saved yet.")
+
+        return "\n".join(lines)
+
+    def _format_saved_for_answer(self, saved_docs: dict[str, _SavedDoc]) -> str:
+        """Full chunk text for all saved documents, used in the final answer call."""
+        parts: list[str] = []
+        for doc in saved_docs.values():
+            header = f"=== {doc.citation} (found via: \"{doc.search_query}\") ==="
+            body = _format_chunks(doc.chunks, show_score=False)
+            parts.append(f"{header}\n{body}")
+        return "\n\n".join(parts)
 
     # ------------------------------------------------------------------
     # Factory
@@ -259,67 +329,105 @@ class AgenticRAGPipeline:
         """
         Run the agentic search loop for one query.
 
-        The LLM is given the query and two tools.  It issues tool calls until
-        it decides it has enough context, or until max_iterations is reached.
-        All chunks retrieved across iterations are deduplicated and returned
-        as retrieved_chunks (used by the evaluation harness for recall/MRR).
+        Alternates between search phase (keyword_search | answer) and review
+        phase (save_citations | answer) for up to max_iterations rounds.
+        When answer() is called or iterations are exhausted, a separate final-
+        answer generation call synthesises the answer from all saved chunks.
+
+        Returns a QueryResult where retrieved_chunks is the ordered union of
+        all saved document chunks (save order, chunk order within each doc).
         """
         from google.genai import types
 
         self._load_client()
-        accumulated: list[RetrievedChunk] = []
 
-        # Build Gemini tool declarations
-        tools = [types.Tool(function_declarations=[
-            types.FunctionDeclaration(
-                name="keyword_search",
-                description=(
-                    "Search the legal document database by keyword using BM25 ranking. "
-                    "Returns the most relevant text passages for the given keywords."
-                ),
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "query": types.Schema(
-                            type=types.Type.STRING,
-                            description="Keyword search query — legal terms, case names, concepts.",
-                        ),
-                        "k": types.Schema(
-                            type=types.Type.INTEGER,
-                            description=f"Number of passages to return (max {self._max_k_per_search}).",
-                        ),
-                    },
-                    required=["query"],
-                ),
-            ),
-            types.FunctionDeclaration(
-                name="get_document",
-                description=(
-                    "Retrieve text passages from a specific legal case by its citation. "
-                    "Use this after keyword_search has identified a promising case."
-                ),
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "citation": types.Schema(
-                            type=types.Type.STRING,
-                            description="Legal citation, e.g. '2022 BCSC 100'.",
-                        ),
-                        "max_chunks": types.Schema(
-                            type=types.Type.INTEGER,
-                            description=f"Maximum passages to return (max {self._max_doc_chunks}).",
-                        ),
-                    },
-                    required=["citation"],
-                ),
-            ),
-        ])]
+        # Per-query mutable state
+        saved_docs: dict[str, _SavedDoc] = {}   # citation → _SavedDoc
+        searches_run: list[str] = []
+        last_search_query: str = ""
 
-        gen_cfg = types.GenerateContentConfig(
-            system_instruction=_SYSTEM_PROMPT,
-            tools=tools,
+        # ---- Tool declarations ----------------------------------------
+        keyword_search_decl = types.FunctionDeclaration(
+            name="keyword_search",
+            description=(
+                "Search the legal document database by keyword using BM25 ranking. "
+                "Returns the most relevant text passages for the given keywords."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "query": types.Schema(
+                        type=types.Type.STRING,
+                        description=(
+                            "Keyword search query — legal terms, case names, legal concepts."
+                        ),
+                    ),
+                    "k": types.Schema(
+                        type=types.Type.INTEGER,
+                        description=(
+                            f"Number of passages to return (max {self._max_k_per_search})."
+                        ),
+                    ),
+                },
+                required=["query"],
+            ),
+        )
+        save_citations_decl = types.FunctionDeclaration(
+            name="save_citations",
+            description=(
+                "Save citations identified as relevant from the last search. "
+                "Saved documents (with the search query that found them) will be shown "
+                "at the start of your next search."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "citations": types.Schema(
+                        type=types.Type.ARRAY,
+                        items=types.Schema(type=types.Type.STRING),
+                        description=(
+                            "Legal citations to save, e.g. ['2022 BCSC 100', '2021 SCC 5']."
+                        ),
+                    ),
+                },
+                required=["citations"],
+            ),
+        )
+        answer_decl = types.FunctionDeclaration(
+            name="answer",
+            description=(
+                "Stop searching and generate the final answer from your saved documents."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={},
+            ),
+        )
+
+        all_tools = types.Tool(
+            function_declarations=[keyword_search_decl, save_citations_decl, answer_decl]
+        )
+
+        # ---- Phase configs (differ only in allowed_function_names) ----
+        search_cfg = types.GenerateContentConfig(
+            system_instruction=_SEARCH_SYSTEM_PROMPT,
+            tools=[all_tools],
             tool_config=types.ToolConfig(
-                function_calling_config=types.FunctionCallingConfig(mode="AUTO")
+                function_calling_config=types.FunctionCallingConfig(
+                    mode="ANY",
+                    allowed_function_names=["keyword_search", "answer"],
+                )
+            ),
+            temperature=0.0,
+        )
+        review_cfg = types.GenerateContentConfig(
+            system_instruction=_REVIEW_SYSTEM_PROMPT,
+            tools=[all_tools],
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(
+                    mode="ANY",
+                    allowed_function_names=["save_citations", "answer"],
+                )
             ),
             temperature=0.0,
         )
@@ -328,109 +436,155 @@ class AgenticRAGPipeline:
             types.Content(role="user", parts=[types.Part(text=query_text)])
         ]
 
-        final_text = ""
+        done = False
         n_iterations = 0
 
         for n_iterations in range(1, self._max_iterations + 1):
+
+            # ---- Search phase -----------------------------------------
             response = self._client.models.generate_content(  # type: ignore[union-attr]
                 model=self._model_name,
                 contents=contents,
-                config=gen_cfg,
+                config=search_cfg,
             )
             usage = response.usage_metadata
             self._track_and_log(usage.prompt_token_count, usage.candidates_token_count)
 
             candidate = response.candidates[0].content
-            function_calls = [p.function_call for p in candidate.parts if p.function_call]
-            text_parts = [p.text for p in candidate.parts if p.text]
+            contents.append(candidate)
 
-            if not function_calls:
-                # LLM decided it has enough context — final answer
-                final_text = "".join(text_parts)
+            fc = next((p.function_call for p in candidate.parts if p.function_call), None)
+            if fc is None or fc.name == "answer":
+                self.log.info(
+                    "AgenticRAGPipeline: answer() in search phase — iteration=%d",
+                    n_iterations,
+                )
+                done = True
                 break
 
-            # Append model turn and execute tools
-            contents.append(candidate)
-            tool_response_parts: list[types.Part] = []
+            # Execute keyword_search
+            search_query = str(fc.args.get("query", ""))
+            k_req = int(fc.args.get("k", self._max_k_per_search))
+            result_text, _ = self._keyword_search(search_query, k_req)
+            last_search_query = search_query
+            searches_run.append(search_query)
 
-            for fc in function_calls:
-                if fc.name == "keyword_search":
-                    result_text, chunks = self._keyword_search(
-                        query=str(fc.args.get("query", "")),
-                        k=int(fc.args.get("k", self._max_k_per_search)),
-                    )
-                elif fc.name == "get_document":
-                    result_text, chunks = self._get_document(
-                        citation=str(fc.args.get("citation", "")),
-                        max_chunks=int(fc.args.get("max_chunks", self._max_doc_chunks)),
-                    )
-                else:
-                    result_text, chunks = f"Unknown tool: {fc.name}", []
-                    self.log.warning("AgenticRAGPipeline: unknown tool call '%s'", fc.name)
+            self.log.debug(
+                "AgenticRAGPipeline iteration=%d search=%r", n_iterations, search_query
+            )
 
-                accumulated.extend(chunks)
-                tool_response_parts.append(types.Part(
+            contents.append(types.Content(
+                role="user",
+                parts=[types.Part(
                     function_response=types.FunctionResponse(
-                        name=fc.name,
+                        name="keyword_search",
                         response={"result": result_text},
                     )
-                ))
-                self.log.debug(
-                    "AgenticRAGPipeline iteration=%d tool=%s chunks_returned=%d total_accumulated=%d",
-                    n_iterations, fc.name, len(chunks), len(accumulated),
+                )],
+            ))
+
+            # ---- Review phase -----------------------------------------
+            response = self._client.models.generate_content(  # type: ignore[union-attr]
+                model=self._model_name,
+                contents=contents,
+                config=review_cfg,
+            )
+            usage = response.usage_metadata
+            self._track_and_log(usage.prompt_token_count, usage.candidates_token_count)
+
+            candidate = response.candidates[0].content
+            contents.append(candidate)
+
+            fc = next((p.function_call for p in candidate.parts if p.function_call), None)
+            if fc is None or fc.name == "answer":
+                self.log.info(
+                    "AgenticRAGPipeline: answer() in review phase — iteration=%d",
+                    n_iterations,
                 )
+                done = True
+                break
 
-            contents.append(types.Content(role="user", parts=tool_response_parts))
+            # Execute save_citations
+            raw_citations: list[str] = list(fc.args.get("citations", []))
+            confirm_text = self._save_citations(raw_citations, last_search_query, saved_docs)
 
-        # If max_iterations exhausted without a text answer, force one
-        if not final_text:
+            # Append state summary to the tool response so the agent has full
+            # context before deciding what to search next.
+            state_text = self._format_state(saved_docs, searches_run)
+            full_response = f"{confirm_text}\n\n{state_text}"
+
+            self.log.debug(
+                "AgenticRAGPipeline iteration=%d save_citations=%r — %s",
+                n_iterations, raw_citations, confirm_text,
+            )
+
+            contents.append(types.Content(
+                role="user",
+                parts=[types.Part(
+                    function_response=types.FunctionResponse(
+                        name="save_citations",
+                        response={"result": full_response},
+                    )
+                )],
+            ))
+
+        if not done:
             self.log.info(
                 "AgenticRAGPipeline: max_iterations=%d reached — forcing final answer",
                 self._max_iterations,
             )
-            contents.append(types.Content(
-                role="user",
-                parts=[types.Part(text=(
-                    "Based on the search results above, please provide your final answer "
-                    "to the original question."
-                ))],
-            ))
-            response = self._client.models.generate_content(  # type: ignore[union-attr]
-                model=self._model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=_SYSTEM_PROMPT,
-                    temperature=0.0,
-                ),
-            )
-            usage = response.usage_metadata
-            self._track_and_log(usage.prompt_token_count, usage.candidates_token_count)
-            final_text = response.text
 
-        # Deduplicate accumulated chunks by (doc_id, chunk_idx), preserving rank order
-        seen: set[tuple[str, int]] = set()
-        unique_chunks: list[RetrievedChunk] = []
-        for chunk in accumulated:
-            key = (chunk.doc_id, chunk.chunk_idx)
-            if key not in seen:
-                seen.add(key)
-                unique_chunks.append(chunk)
+        # ---- Step 5: final answer generation (no tools) ---------------
+        final_text = self._generate_final_answer(query_text, saved_docs)
+
+        # Flatten saved docs into retrieved_chunks in save order
+        retrieved_chunks: list[RetrievedChunk] = []
+        for doc in saved_docs.values():
+            retrieved_chunks.extend(doc.chunks)
 
         self.log.info(
-            "AgenticRAGPipeline: complete | iterations=%d | unique_chunks=%d | "
-            "total_accumulated=%d",
-            n_iterations, len(unique_chunks), len(accumulated),
+            "AgenticRAGPipeline: complete | iterations=%d | saved_docs=%d | "
+            "retrieved_chunks=%d | searches=%d",
+            n_iterations, len(saved_docs), len(retrieved_chunks), len(searches_run),
         )
 
         return QueryResult(
             query=query_text,
-            retrieved_chunks=unique_chunks,
+            retrieved_chunks=retrieved_chunks,
             answer=final_text or None,
             metadata={
                 "iterations": n_iterations,
-                "total_chunks_accumulated": len(accumulated),
+                "saved_docs": list(saved_docs.keys()),
+                "searches_run": searches_run,
             },
         )
+
+    def _generate_final_answer(
+        self,
+        query_text: str,
+        saved_docs: dict[str, _SavedDoc],
+    ) -> str:
+        """Separate generation call — no tools — from all saved document chunks."""
+        from google.genai import types
+
+        if saved_docs:
+            context = self._format_saved_for_answer(saved_docs)
+        else:
+            context = "No documents were saved during the research phase."
+
+        prompt = f"Question: {query_text}\n\n{context}"
+
+        response = self._client.models.generate_content(  # type: ignore[union-attr]
+            model=self._model_name,
+            contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+            config=types.GenerateContentConfig(
+                system_instruction=_ANSWER_SYSTEM_PROMPT,
+                temperature=0.0,
+            ),
+        )
+        usage = response.usage_metadata
+        self._track_and_log(usage.prompt_token_count, usage.candidates_token_count)
+        return response.text or ""
 
     def batch_query(self, queries: list[str], k: int | None = None) -> list[QueryResult]:
         return [self.query(q, k=k) for q in queries]

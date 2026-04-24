@@ -1,0 +1,38 @@
+# Experiment: BM25 sparse retrieval + recursive 1024-char chunking + 1000 docs
+# The embedder is used only to build the index (chunks.pkl) — BM25 does not use
+# embeddings at query time.  Matches qwen_recursive_1024 so the index is shared.
+base_config: ../../configs/base.yaml
+
+experiment_id: bm25_recursive_1024_1k-docs
+description: "BM25 sparse retriever, recursive 1024-char chunks, 1000-doc corpus"
+
+dataset:
+  max_docs: 1000
+
+chunker:
+  type: chunkers.recursive.RecursiveChunker
+  max_chunk_chars: 1024
+  overlap_chars: 128
+
+embedder:
+  type: embedders.qwen.QwenEmbedder
+  model_name: Qwen/Qwen3-Embedding-8B
+  device: cuda:0
+  batch_size: 16
+
+evaluation:
+  k_values: [3, 5, 10, 20, 50]
+  metrics:
+    - recall_at_k
+    - doc_recall_at_k
+    - hit_at_k
+    - mrr
+    - ndcg_at_k
+
+indexing:
+  document_batch_size: 10
+  embedding_batch_size: 16
+  save_intermediate_every: 50
+
+logging:
+  level: DEBUG

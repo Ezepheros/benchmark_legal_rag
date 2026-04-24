@@ -19,7 +19,7 @@ embedder:
   batch_size: 16
 
 evaluation:
-  k_values: [3, 5, 10]
+  k_values: [3, 5, 10, 20, 50]
   metrics:
     - recall_at_k
     - doc_recall_at_k

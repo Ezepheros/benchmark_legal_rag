@@ -28,6 +28,11 @@ except ImportError:
     pass  # python-dotenv not installed; fall back to shell environment
 
 from benchmark_rag.config.schemas import ExperimentConfig
+from benchmark_rag.cost_logging import (
+    DEFAULT_INDEXING_COST_CSV,
+    append_cost_entry,
+    sum_component_costs,
+)
 from benchmark_rag.logging import setup_experiment_logging, get_logger
 from benchmark_rag.pipeline.indexing_pipeline import IndexingPipeline
 
@@ -192,6 +197,17 @@ def main():
     pipeline = IndexingPipeline(cfg, force_reindex=args.force_reindex)
     output_dir = pipeline.run(documents)
     log.info(f"Indexing complete. Output: {output_dir}")
+
+    run_cost = sum_component_costs(pipeline)
+    total, csv_path = append_cost_entry(
+        DEFAULT_INDEXING_COST_CSV,
+        experiment_id=cfg.experiment_id,
+        cost_of_run_usd=run_cost,
+    )
+    log.info(
+        f"Cost logged to {csv_path}: run=${run_cost:.6f} "
+        f"| total_so_far=${total:.6f}"
+    )
 
 
 if __name__ == "__main__":

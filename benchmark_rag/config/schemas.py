@@ -105,7 +105,7 @@ class DatasetConfig(BaseModel):
 
 class EvaluationConfig(BaseModel):
     queries_path: str
-    k_values: list[int] = Field(default_factory=lambda: [5, 25, 100])
+    k_values: list[int] = Field(default_factory=lambda: [3, 5, 10, 20, 50])
     rerank: bool = False
     generate: bool = False
     metrics: list[str] = Field(

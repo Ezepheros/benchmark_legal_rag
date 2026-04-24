@@ -34,6 +34,11 @@ import pandas as pd
 from tqdm import tqdm
 
 from benchmark_rag.config.schemas import ExperimentConfig
+from benchmark_rag.cost_logging import (
+    DEFAULT_BENCHMARK_COST_CSV,
+    append_cost_entry,
+    sum_component_costs,
+)
 from benchmark_rag.evaluation.metrics import evaluate_retrieval, EvaluationResult
 from benchmark_rag.logging import setup_experiment_logging, get_logger
 from benchmark_rag.pipeline.rag_pipeline import RAGPipeline
@@ -185,21 +190,8 @@ def main():
     elif is_hybrid:
         from benchmark_rag.pipeline.hybrid_pipeline import HybridRAGPipeline
         pipeline = HybridRAGPipeline.from_config(cfg)
-    elif args.generate and cfg.generator is not None:
-        pipeline = RAGPipeline.from_config(cfg)
     else:
-        # Retrieval-only: build without generator
-        from benchmark_rag.components.retrievers.faiss_retriever import FaissRetriever
-        from benchmark_rag.registry import build_from_component_config
-
-        embedder = build_from_component_config(cfg.embedder.to_build_dict())
-        retriever = FaissRetriever(metric=cfg.retriever.model_extra.get("metric", "cosine"))
-        retriever.load_index(Path(cfg.indexing.output_dir) / "index")
-        pipeline = RAGPipeline(
-            embedder=embedder,
-            retriever=retriever,
-            k=max(eval_cfg.k_values),
-        )
+        pipeline = RAGPipeline.from_config(cfg)
 
     # --- Run queries ---
     # ground_truth_citations is a list[str] — a query may have multiple relevant docs
@@ -246,6 +238,7 @@ def main():
     )
 
     # --- Optional: LLM judge ---
+    judge = None
     if args.judge and cfg.generator is not None:
         from benchmark_rag.components.generators.gemini import GeminiJudge
 
@@ -285,6 +278,18 @@ def main():
     )
 
     log.info(f"Results saved to {results_dir}")
+
+    run_cost = sum_component_costs(pipeline, judge)
+    total, csv_path = append_cost_entry(
+        DEFAULT_BENCHMARK_COST_CSV,
+        experiment_id=cfg.experiment_id,
+        cost_of_run_usd=run_cost,
+    )
+    log.info(
+        f"Cost logged to {csv_path}: run=${run_cost:.6f} "
+        f"| total_so_far=${total:.6f}"
+    )
+
     print(eval_result.summary())
 
 

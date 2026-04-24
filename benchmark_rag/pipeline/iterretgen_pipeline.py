@@ -28,21 +28,13 @@ from pathlib import Path
 from benchmark_rag.components.base import BaseEmbedder, BaseGenerator, BaseRetriever, RetrievedChunk
 from benchmark_rag.config.schemas import ExperimentConfig
 from benchmark_rag.pipeline.rag_pipeline import QueryResult
+from benchmark_rag.prompts.iterretgen import (
+    FULL_INTERMEDIATE_PROMPT as _FULL_INTERMEDIATE_PROMPT,
+    SHORT_INTERMEDIATE_PROMPT as _SHORT_INTERMEDIATE_PROMPT,
+)
 from benchmark_rag.registry import build_from_component_config
 
 log = logging.getLogger(__name__)
-
-_SHORT_INTERMEDIATE_PROMPT = (
-    "You are a legal research assistant. Based on the provided context passages, "
-    "write a brief answer to the question covering the most relevant information. "
-    "Aim for roughly a short paragraph."
-)
-
-_FULL_INTERMEDIATE_PROMPT = (
-    "You are a legal research assistant. Answer the question accurately and concisely "
-    "using only the provided context passages. If the context does not contain enough "
-    "information to answer, say so clearly. Cite the relevant passage(s) when possible."
-)
 
 
 class IterRetGenPipeline:

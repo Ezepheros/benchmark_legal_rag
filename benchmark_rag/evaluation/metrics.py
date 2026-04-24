@@ -124,11 +124,17 @@ def evaluate_retrieval(
     n = len(retrieved_lists)
     assert n == len(relevant_sets), "retrieved_lists and relevant_sets must have the same length"
 
+    # Collapse chunk-level retrieved lists to document-level (unique doc_ids, first-occurrence rank).
+    # Pipelines return one entry per chunk, so the same doc_id may appear many times. Without this
+    # step NDCG can exceed 1.0 (multiple matching chunks each earn DCG credit) and precision is
+    # inflated (k slots are consumed by repeat doc_ids).
+    deduped_lists = [list(dict.fromkeys(ret)) for ret in retrieved_lists]
+
     scores: dict[str, dict[int, float]] = {}
 
     for metric in metric_names:
         if metric == "mrr":
-            vals = [mrr(ret, rel) for ret, rel in zip(retrieved_lists, relevant_sets)]
+            vals = [mrr(ret, rel) for ret, rel in zip(deduped_lists, relevant_sets)]
             scores["mrr"] = {-1: sum(vals) / n}
         else:
             scores[metric] = {}
@@ -145,7 +151,7 @@ def evaluate_retrieval(
                     fn = ndcg_at_k
                 else:
                     raise ValueError(f"Unknown metric: {metric}")
-                vals = [fn(ret, rel, k) for ret, rel in zip(retrieved_lists, relevant_sets)]
+                vals = [fn(ret, rel, k) for ret, rel in zip(deduped_lists, relevant_sets)]
                 scores[metric][k] = sum(vals) / n
 
     # Clean up mrr key (use 0 as a sentinel k)

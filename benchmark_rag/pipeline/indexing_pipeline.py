@@ -19,6 +19,7 @@ Usage
 """
 from __future__ import annotations
 
+import inspect
 import pickle
 import time
 from pathlib import Path
@@ -138,8 +139,11 @@ class IndexingPipeline:
 
             embedded_chunks = self._embed_chunks(all_chunks, embedder)
 
-            self.log.info("Building FAISS index...")
-            retriever.build_index(embedded_chunks)
+            self.log.info("Building index...")
+            if "documents" in inspect.signature(retriever.build_index).parameters:
+                retriever.build_index(embedded_chunks, documents=documents)
+            else:
+                retriever.build_index(embedded_chunks)
             retriever.save_index(index_path)
             self.log.info(
                 f"Index built: {retriever._index.ntotal} vectors | saved to {index_path}"
@@ -152,6 +156,9 @@ class IndexingPipeline:
         if hasattr(embedder, "log_usage_summary"):
             embedder.log_usage_summary()
         log_resource_snapshot(self.log)
+
+        # Stash so external callers (scripts) can introspect cost trackers.
+        self.embedder = embedder
 
         return self._output_dir
 

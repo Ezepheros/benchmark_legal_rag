@@ -8,13 +8,15 @@ from __future__ import annotations
 import logging
 
 from benchmark_rag.components.base import BaseGenerator, RetrievedChunk
+from benchmark_rag.prompts.answer_generator import ANSWER_SYSTEM_PROMPT
+from benchmark_rag.prompts.judge import JUDGE_SYSTEM_PROMPT
 
 log = logging.getLogger(__name__)
 
 # Per-token pricing in USD. Update when Gemini pricing changes.
 # Source: https://ai.google.dev/pricing
 _PRICING: dict[str, tuple[float, float]] = {
-    "gemini-2.5-flash": (0.075 / 1_000_000, 0.30 / 1_000_000),
+    "gemini-2.5-flash": (0.30 / 1_000_000, 0.30 / 1_000_000),
     "gemini-2.5-pro":   (1.25  / 1_000_000, 10.0  / 1_000_000),
     "gemini-2.0-flash": (0.10  / 1_000_000, 0.40  / 1_000_000),
 }
@@ -25,27 +27,6 @@ def _estimate_cost(model_name: str, input_tokens: int, output_tokens: int) -> fl
         if model_name.startswith(prefix):
             return input_tokens * in_price + output_tokens * out_price
     return None
-
-
-_DEFAULT_SYSTEM_PROMPT = (
-    "You are a legal research assistant. Answer the question accurately and concisely "
-    "using only the provided context passages. If the context does not contain enough "
-    "information to answer, say so clearly. Cite the relevant passage(s) when possible."
-)
-
-_DEFAULT_JUDGE_PROMPT = (
-    "You are an expert legal judge evaluating the quality of a RAG system's answer.\n\n"
-    "Given:\n"
-    "  - A legal question\n"
-    "  - A generated answer\n"
-    "  - The ground-truth reference answer\n\n"
-    "Score the generated answer on a scale of 1–5 for each of:\n"
-    "  1. Faithfulness: Is the answer grounded in the retrieved context?\n"
-    "  2. Correctness: Does it match the reference answer?\n"
-    "  3. Completeness: Does it cover all key points in the reference?\n\n"
-    "Respond ONLY with valid JSON in this exact format:\n"
-    '{"faithfulness": <1-5>, "correctness": <1-5>, "completeness": <1-5>, "rationale": "<brief explanation>"}'
-)
 
 
 def _build_context(chunks: list[RetrievedChunk]) -> str:
@@ -88,7 +69,7 @@ class GeminiGenerator(BaseGenerator):
     def __init__(
         self,
         model_name: str = "gemini-2.5-flash",
-        system_prompt: str = _DEFAULT_SYSTEM_PROMPT,
+        system_prompt: str = ANSWER_SYSTEM_PROMPT,
         api_key: str | None = None,
         temperature: float = 0.0,
         max_output_tokens: int = 1024,
@@ -227,7 +208,7 @@ class GeminiJudge:
             model=self.model_name,
             contents=prompt,
             config=types.GenerateContentConfig(
-                system_instruction=_DEFAULT_JUDGE_PROMPT,
+                system_instruction=JUDGE_SYSTEM_PROMPT,
                 temperature=self.temperature,
                 response_mime_type="application/json",
             ),

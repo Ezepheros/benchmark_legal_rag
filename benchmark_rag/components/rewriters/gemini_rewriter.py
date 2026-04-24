@@ -9,16 +9,11 @@ from __future__ import annotations
 import logging
 import time
 
+from benchmark_rag.prompts.query_rewriter import REWRITER_SYSTEM_PROMPT as _SYSTEM_PROMPT
+
 log = logging.getLogger(__name__)
 
 _RETRY_DELAYS = [5, 10, 30, 60, 120]  # seconds between attempts
-
-_SYSTEM_PROMPT = (
-    "You are a legal expert assistant. Your task is to rephrase the given query "
-    "using precise legal terminology and language as it would appear in a Canadian "
-    "legal document or court filing. "
-    "Return only the rewritten query, with no explanation, preamble, or commentary."
-)
 
 
 def _get_api_key(api_key: str | None) -> str:

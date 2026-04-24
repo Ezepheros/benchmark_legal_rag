@@ -33,7 +33,7 @@ reranker: null
 evaluation:
   # queries.json produced by build_test_dataset.py
   queries_path: data/test_dataset/queries.json
-  k_values: [5, 25, 100]
+  k_values: [3, 5, 10, 20, 50]
   rerank: false
   generate: false
   metrics:

@@ -1,0 +1,109 @@
+"""
+Append per-run cost summaries to a shared CSV log.
+
+Indexing and evaluation each have their own default CSV — indexing is a one-off
+per dataset/chunker/embedder, evaluation re-runs per experiment, and mixing
+them makes trend analysis noisy.
+
+CSV schema (same for both files):
+    DATE_TIME, EXPERIMENT_ID, COST_OF_RUN, TOTAL_COST_SO_FAR
+
+TOTAL_COST_SO_FAR is recomputed each call as the sum of COST_OF_RUN across all
+prior rows plus the new row, so hand-editing the file remains consistent.
+"""
+from __future__ import annotations
+
+import csv
+from datetime import datetime
+from pathlib import Path
+
+
+_FIELDNAMES = ["DATE_TIME", "EXPERIMENT_ID", "COST_OF_RUN", "TOTAL_COST_SO_FAR"]
+
+DEFAULT_INDEXING_COST_CSV = Path("runs/cost_log_indexing.csv")
+DEFAULT_BENCHMARK_COST_CSV = Path("runs/cost_log_benchmark.csv")
+
+_SUBCOMPONENT_ATTRS = (
+    "embedder", "retriever", "reranker", "generator",
+    "intermediate_generator", "rewriter",
+)
+
+
+def _extract_cost(obj) -> float:
+    """Read the tracked cost off one object; 0.0 when no cost is tracked."""
+    if obj is None:
+        return 0.0
+    for attr in ("_total_est_cost_usd", "_total_cost"):
+        v = getattr(obj, attr, None)
+        if v is None:
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def sum_component_costs(*roots) -> float:
+    """
+    Sum tracked costs across a pipeline and/or loose components.
+
+    Walks each root's own cost plus any sub-components reachable via the
+    standard attribute names in ``_SUBCOMPONENT_ATTRS``.  Objects visited
+    more than once are deduplicated by ``id()`` so a component shared
+    between roots is not double-counted.
+    """
+    total = 0.0
+    seen: set[int] = set()
+    stack = [r for r in roots if r is not None]
+    while stack:
+        obj = stack.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        total += _extract_cost(obj)
+        for attr in _SUBCOMPONENT_ATTRS:
+            child = getattr(obj, attr, None)
+            if child is not None:
+                stack.append(child)
+    return total
+
+
+def append_cost_entry(
+    csv_path: str | Path,
+    experiment_id: str,
+    cost_of_run_usd: float,
+) -> tuple[float, Path]:
+    """
+    Append one row to the shared cost CSV, creating it with a header on first
+    use.  Returns ``(running_total_usd, resolved_csv_path)``.
+    """
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    prior_total = 0.0
+    if csv_path.exists():
+        with csv_path.open("r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    prior_total += float(row.get("COST_OF_RUN", 0.0) or 0.0)
+                except ValueError:
+                    pass
+
+    cost = float(cost_of_run_usd)
+    new_total = prior_total + cost
+    write_header = not csv_path.exists()
+
+    with csv_path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_FIELDNAMES)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({
+            "DATE_TIME": datetime.now().isoformat(timespec="seconds"),
+            "EXPERIMENT_ID": experiment_id,
+            "COST_OF_RUN": f"{cost:.6f}",
+            "TOTAL_COST_SO_FAR": f"{new_total:.6f}",
+        })
+
+    return new_total, csv_path
