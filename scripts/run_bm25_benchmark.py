@@ -33,7 +33,7 @@ from tqdm import tqdm
 
 from benchmark_rag.components.retrievers.bm25_retriever import BM25Retriever
 from benchmark_rag.config.schemas import ExperimentConfig
-from benchmark_rag.evaluation.metrics import evaluate_retrieval
+from benchmark_rag.evaluation.metrics import evaluate_retrieval, EXCLUDED_QUERY_IDS, is_query_usable
 from benchmark_rag.logging import setup_experiment_logging, get_logger
 
 
@@ -52,11 +52,48 @@ def load_queries(queries_path: str) -> list[dict]:
     raise ValueError(f"Unsupported query file format: {p.suffix}")
 
 
+def _load_documents(cfg: ExperimentConfig):
+    """Load Document objects from the dataset parquet (same logic as run_indexing.py)."""
+    from benchmark_rag.components.base import Document
+    import json as _json
+
+    dataset_path = Path(cfg.dataset.path)
+    max_docs = cfg.dataset.max_docs
+    df = pd.read_parquet(dataset_path)
+    if max_docs:
+        df = df.head(max_docs)
+
+    documents = []
+    for _, row in df.iterrows():
+        text = row.get("text", "")
+        if not text or not str(text).strip():
+            continue
+        meta = {}
+        for k, v in row.items():
+            if k == "text":
+                continue
+            if k in ("ground_truth_query_ids", "ground_truth_query_texts", "snippets"):
+                try:
+                    meta[k] = _json.loads(v) if isinstance(v, str) else v
+                except Exception:
+                    meta[k] = v
+            else:
+                meta[k] = v
+        documents.append(Document(
+            doc_id=str(row.get("citation", row.name)),
+            text=str(text),
+            metadata=meta,
+        ))
+    return documents
+
+
 def main():
     parser = argparse.ArgumentParser(description="BM25 sparse retrieval benchmark.")
     parser.add_argument("--config", required=True, help="Path to experiment YAML config")
     parser.add_argument("--k1", type=float, default=None, help="BM25 k1 parameter (overrides config)")
     parser.add_argument("--b",  type=float, default=None, help="BM25 b parameter (overrides config)")
+    parser.add_argument("--doc-level", action="store_true",
+                        help="Index full documents instead of chunks (no FAISS index needed)")
     args = parser.parse_args()
 
     cfg = ExperimentConfig.from_yaml(args.config)
@@ -76,25 +113,36 @@ def main():
     log.info("=" * 60)
     log.info(f"EXPERIMENT : {cfg.experiment_id}")
     log.info(f"DESCRIPTION: {cfg.description}")
-    log.info(f"BM25 params: k1={k1}  b={b}")
+    log.info(f"BM25 params: k1={k1}  b={b}  doc_level={args.doc_level}")
     log.info(f"INDEX ID   : {cfg.index_id}")
     log.info("=" * 60)
 
-    # --- Load chunks from the existing index ---
-    chunks_path = Path(cfg.indexing.output_dir) / "index.chunks.pkl"
-    if not chunks_path.exists():
-        log.error(f"Chunks file not found at {chunks_path}. Run run_indexing.py first.")
-        sys.exit(1)
+    if args.doc_level:
+        # --- Document-level BM25: load documents from parquet, no FAISS needed ---
+        from benchmark_rag.components.base import EmbeddedChunk
+        documents = _load_documents(cfg)
+        log.info(f"Loaded {len(documents)} documents from {cfg.dataset.path}")
+        chunks = [
+            EmbeddedChunk(text=d.text, doc_id=d.doc_id, chunk_idx=0, metadata=d.metadata)
+            for d in documents
+        ]
+        log.info(f"Building document-level BM25 index (k1={k1}, b={b}) ...")
+        retriever = BM25Retriever(k1=k1, b=b, index_level="document")
+        retriever.build_index(chunks, documents=documents)
+    else:
+        # --- Chunk-level BM25: load chunks from existing FAISS index ---
+        chunks_path = Path(cfg.indexing.output_dir) / "index.chunks.pkl"
+        if not chunks_path.exists():
+            log.error(f"Chunks file not found at {chunks_path}. Run run_indexing.py first.")
+            sys.exit(1)
+        log.info(f"Loading chunks from {chunks_path}")
+        with open(chunks_path, "rb") as f:
+            chunks = pickle.load(f)
+        log.info(f"  {len(chunks)} chunks loaded.")
+        log.info(f"Building BM25 index (k1={k1}, b={b}) ...")
+        retriever = BM25Retriever(k1=k1, b=b)
+        retriever.build_index(chunks)
 
-    log.info(f"Loading chunks from {chunks_path}")
-    with open(chunks_path, "rb") as f:
-        chunks = pickle.load(f)
-    log.info(f"  {len(chunks)} chunks loaded.")
-
-    # --- Build BM25 index ---
-    log.info(f"Building BM25 index (k1={k1}, b={b}) ...")
-    retriever = BM25Retriever(k1=k1, b=b)
-    retriever.build_index(chunks)
     log.info("  Done.")
 
     # --- Load queries ---
@@ -112,8 +160,11 @@ def main():
 
     for q in tqdm(queries, desc="Querying (BM25)"):
         query_text = str(q.get("query_text", ""))
+        province = q.get("province", "")
+        if province:
+            query_text = f"I am in {province}. {query_text}"
         gold_citations: set[str] = set(q.get("ground_truth_citations", []))
-        if not query_text.strip() or not gold_citations:
+        if not query_text.strip() or not is_query_usable(q):
             continue
 
         results = retriever.retrieve_text(query_text, k=max_k)

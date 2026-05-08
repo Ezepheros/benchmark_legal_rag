@@ -16,6 +16,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+class BudgetExceededError(Exception):
+    """Raised when a component's cost cap is exceeded."""
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Shared data containers
 # ---------------------------------------------------------------------------

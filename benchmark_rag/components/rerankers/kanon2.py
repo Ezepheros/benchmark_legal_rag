@@ -144,7 +144,8 @@ class Kanon2Reranker(BaseReranker):
 
             if self.max_cost_usd is not None:
                 if self._total_est_cost_usd + batch_est_cost > self.max_cost_usd:
-                    raise RuntimeError(
+                    from benchmark_rag.components.base import BudgetExceededError
+                    raise BudgetExceededError(
                         f"Kanon2Reranker cost limit of ${self.max_cost_usd:.2f} would be exceeded "
                         f"(accumulated: ${self._total_est_cost_usd:.4f}, "
                         f"next batch est: ${batch_est_cost:.4f}). Stopping."

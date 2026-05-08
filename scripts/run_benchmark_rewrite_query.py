@@ -36,7 +36,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from benchmark_rag.config.schemas import ExperimentConfig
-from benchmark_rag.evaluation.metrics import evaluate_retrieval, EvaluationResult
+from benchmark_rag.evaluation.metrics import evaluate_retrieval, EvaluationResult, EXCLUDED_QUERY_IDS, is_query_usable
 from benchmark_rag.logging import setup_experiment_logging, get_logger
 from benchmark_rag.pipeline.rag_pipeline import RAGPipeline
 from benchmark_rag.registry import build_from_component_config
@@ -135,8 +135,11 @@ def main():
 
     for q in tqdm(queries, desc="Querying (rewrite → retrieve)"):
         original_query = str(q.get("query_text", ""))
+        province = q.get("province", "")
+        if province:
+            original_query = f"I am in {province}. {original_query}"
         gold_citations: set[str] = set(q.get("ground_truth_citations", []))
-        if not original_query.strip() or not gold_citations:
+        if not original_query.strip() or not is_query_usable(q):
             continue
 
         rewritten_query = rewriter.rewrite(original_query)

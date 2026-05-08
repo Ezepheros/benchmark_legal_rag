@@ -121,7 +121,8 @@ class Kanon2Embedder(BaseEmbedder):
             batch_est_cost = batch_est_tokens / 1_000_000 * self._COST_PER_1M_TOKENS
             if self.max_cost_usd is not None:
                 if self._total_est_cost_usd + batch_est_cost > self.max_cost_usd:
-                    raise RuntimeError(
+                    from benchmark_rag.components.base import BudgetExceededError
+                    raise BudgetExceededError(
                         f"Kanon2Embedder cost limit of ${self.max_cost_usd:.2f} would be exceeded "
                         f"(accumulated: ${self._total_est_cost_usd:.4f}, "
                         f"next batch est: ${batch_est_cost:.4f}). "

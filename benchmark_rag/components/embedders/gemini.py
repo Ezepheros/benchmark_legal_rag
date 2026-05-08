@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from benchmark_rag.components.base import BaseEmbedder
 
 log = logging.getLogger(__name__)
+
+_RETRY_DELAYS = [5, 10, 30, 60, 120]  # initial backoff; after exhausted, repeats 120s forever
 
 
 class GeminiEmbedder(BaseEmbedder):
@@ -27,8 +30,12 @@ class GeminiEmbedder(BaseEmbedder):
         Maximum estimated spend in USD before raising RuntimeError.
     """
 
-    _EMBEDDING_DIM = 3072  # gemini-embedding-001 output dim
-    _COST_PER_1K_TOKENS = 0.0001  # USD estimate (chars/4 token estimate)
+    _EMBEDDING_DIM = 3072
+    _COST_PER_1M_TOKENS: dict[str, float] = {
+        "gemini-embedding-001": 0.15,
+        "gemini-embedding-2": 0.20,
+    }
+    _DEFAULT_COST_PER_1M_TOKENS = 0.20
 
     def __init__(
         self,
@@ -68,7 +75,10 @@ class GeminiEmbedder(BaseEmbedder):
 
     def _track_and_log(self, n_texts: int, call_est_tokens: int) -> None:
         self._total_est_input_tokens += call_est_tokens
-        call_est_cost = call_est_tokens / 1000 * self._COST_PER_1K_TOKENS
+        cost_per_1m = self._COST_PER_1M_TOKENS.get(
+            self.model_name, self._DEFAULT_COST_PER_1M_TOKENS
+        )
+        call_est_cost = call_est_tokens * cost_per_1m / 1_000_000
         self._total_est_cost_usd += call_est_cost
         log.info(
             "GeminiEmbedder model=%s task=%s | embed call: texts=%d est_input_tokens=%d est_cost=$%.4f"
@@ -87,6 +97,29 @@ class GeminiEmbedder(BaseEmbedder):
             f"{self.max_cost_usd:.2f}" if self.max_cost_usd is not None else "none",
         )
 
+    def _call_with_retry(self, batch: list[str], types):
+        from google.genai.errors import ClientError, ServerError
+
+        attempt = 0
+        while True:
+            try:
+                return self._client.models.embed_content(  # type: ignore[union-attr]
+                    model=self.model_name,
+                    contents=batch,
+                    config=types.EmbedContentConfig(task_type=self.task_type),
+                )
+            except (ClientError, ServerError) as e:
+                code = getattr(e, "code", None)
+                if code not in (429, 503):
+                    raise
+                delay = _RETRY_DELAYS[attempt] if attempt < len(_RETRY_DELAYS) else _RETRY_DELAYS[-1]
+                attempt += 1
+                log.warning(
+                    "GeminiEmbedder %d %s — retrying in %ds (attempt %d)...",
+                    code, type(e).__name__, delay, attempt,
+                )
+                time.sleep(delay)
+
     def _embed(self, texts: list[str]) -> list[list[float]]:
         from google.genai import types
 
@@ -98,20 +131,20 @@ class GeminiEmbedder(BaseEmbedder):
         for i in range(0, len(texts), self.batch_size):
             batch = texts[i : i + self.batch_size]
             batch_est_tokens = sum(len(t) for t in batch) // 4
-            batch_est_cost = batch_est_tokens / 1000 * self._COST_PER_1K_TOKENS
+            cost_per_1m = self._COST_PER_1M_TOKENS.get(
+                self.model_name, self._DEFAULT_COST_PER_1M_TOKENS
+            )
+            batch_est_cost = batch_est_tokens * cost_per_1m / 1_000_000
             if self.max_cost_usd is not None:
                 if self._total_est_cost_usd + batch_est_cost > self.max_cost_usd:
-                    raise RuntimeError(
+                    from benchmark_rag.components.base import BudgetExceededError
+                    raise BudgetExceededError(
                         f"GeminiEmbedder cost limit of ${self.max_cost_usd:.2f} would be exceeded "
                         f"(accumulated: ${self._total_est_cost_usd:.4f}, "
                         f"next batch est: ${batch_est_cost:.4f}). "
                         f"Stopping before batch {i // self.batch_size + 1}/{n_batches}."
                     )
-            result = self._client.models.embed_content(  # type: ignore[union-attr]
-                model=self.model_name,
-                contents=batch,
-                config=types.EmbedContentConfig(task_type=self.task_type),
-            )
+            result = self._call_with_retry(batch, types)
             all_embeddings.extend([e.values for e in result.embeddings])
             call_est_tokens += batch_est_tokens
             log.debug(

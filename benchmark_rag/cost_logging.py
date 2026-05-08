@@ -6,7 +6,8 @@ per dataset/chunker/embedder, evaluation re-runs per experiment, and mixing
 them makes trend analysis noisy.
 
 CSV schema (same for both files):
-    DATE_TIME, EXPERIMENT_ID, COST_OF_RUN, TOTAL_COST_SO_FAR
+    DATE_TIME, EXPERIMENT_ID, COST_OF_RUN, EMBEDDING_COST, RERANKER_COST,
+    GENERATOR_COST, OTHER_COST, TOTAL_COST_SO_FAR
 
 TOTAL_COST_SO_FAR is recomputed each call as the sum of COST_OF_RUN across all
 prior rows plus the new row, so hand-editing the file remains consistent.
@@ -18,7 +19,11 @@ from datetime import datetime
 from pathlib import Path
 
 
-_FIELDNAMES = ["DATE_TIME", "EXPERIMENT_ID", "COST_OF_RUN", "TOTAL_COST_SO_FAR"]
+_FIELDNAMES = [
+    "DATE_TIME", "EXPERIMENT_ID", "COST_OF_RUN",
+    "EMBEDDING_COST", "RERANKER_COST", "GENERATOR_COST", "OTHER_COST",
+    "TOTAL_COST_SO_FAR",
+]
 
 DEFAULT_INDEXING_COST_CSV = Path("runs/cost_log_indexing.csv")
 DEFAULT_BENCHMARK_COST_CSV = Path("runs/cost_log_benchmark.csv")
@@ -44,35 +49,63 @@ def _extract_cost(obj) -> float:
     return 0.0
 
 
-def sum_component_costs(*roots) -> float:
+def collect_component_costs(*roots) -> dict[str, float]:
     """
-    Sum tracked costs across a pipeline and/or loose components.
+    Collect per-component cost breakdown from a pipeline and/or loose components.
 
-    Walks each root's own cost plus any sub-components reachable via the
-    standard attribute names in ``_SUBCOMPONENT_ATTRS``.  Objects visited
-    more than once are deduplicated by ``id()`` so a component shared
-    between roots is not double-counted.
+    Returns a dict with keys: embedding, reranker, generator, other, total.
     """
-    total = 0.0
+    embedding_attrs = {"embedder"}
+    reranker_attrs = {"reranker"}
+    generator_attrs = {"generator", "intermediate_generator", "rewriter"}
+
+    costs: dict[str, float] = {
+        "embedding": 0.0,
+        "reranker": 0.0,
+        "generator": 0.0,
+        "other": 0.0,
+    }
+
     seen: set[int] = set()
-    stack = [r for r in roots if r is not None]
-    while stack:
-        obj = stack.pop()
-        if id(obj) in seen:
+
+    for root in roots:
+        if root is None:
             continue
-        seen.add(id(obj))
-        total += _extract_cost(obj)
+        # Root object's own cost (e.g. AgenticRAGPipeline._total_cost)
+        root_cost = _extract_cost(root)
+        if root_cost > 0 and id(root) not in seen:
+            costs["other"] += root_cost
+            seen.add(id(root))
+
         for attr in _SUBCOMPONENT_ATTRS:
-            child = getattr(obj, attr, None)
-            if child is not None:
-                stack.append(child)
-    return total
+            child = getattr(root, attr, None)
+            if child is None or id(child) in seen:
+                continue
+            seen.add(id(child))
+            child_cost = _extract_cost(child)
+            if attr in embedding_attrs:
+                costs["embedding"] += child_cost
+            elif attr in reranker_attrs:
+                costs["reranker"] += child_cost
+            elif attr in generator_attrs:
+                costs["generator"] += child_cost
+            else:
+                costs["other"] += child_cost
+
+    costs["total"] = sum(costs.values())
+    return costs
+
+
+def sum_component_costs(*roots) -> float:
+    """Sum tracked costs across a pipeline and/or loose components."""
+    return collect_component_costs(*roots)["total"]
 
 
 def append_cost_entry(
     csv_path: str | Path,
     experiment_id: str,
     cost_of_run_usd: float,
+    cost_breakdown: dict[str, float] | None = None,
 ) -> tuple[float, Path]:
     """
     Append one row to the shared cost CSV, creating it with a header on first
@@ -95,6 +128,8 @@ def append_cost_entry(
     new_total = prior_total + cost
     write_header = not csv_path.exists()
 
+    bd = cost_breakdown or {}
+
     with csv_path.open("a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=_FIELDNAMES)
         if write_header:
@@ -103,6 +138,10 @@ def append_cost_entry(
             "DATE_TIME": datetime.now().isoformat(timespec="seconds"),
             "EXPERIMENT_ID": experiment_id,
             "COST_OF_RUN": f"{cost:.6f}",
+            "EMBEDDING_COST": f"{bd.get('embedding', 0.0):.6f}",
+            "RERANKER_COST": f"{bd.get('reranker', 0.0):.6f}",
+            "GENERATOR_COST": f"{bd.get('generator', 0.0):.6f}",
+            "OTHER_COST": f"{bd.get('other', 0.0):.6f}",
             "TOTAL_COST_SO_FAR": f"{new_total:.6f}",
         })
 

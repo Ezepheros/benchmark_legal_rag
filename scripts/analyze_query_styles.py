@@ -31,7 +31,7 @@ import matplotlib.patches as mpatches
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from benchmark_rag.evaluation.metrics import evaluate_retrieval, ALL_METRICS
+from benchmark_rag.evaluation.metrics import evaluate_retrieval, ALL_METRICS, EXCLUDED_QUERY_IDS
 
 RUNS_DIR = Path(__file__).parent.parent / "runs"
 
@@ -53,6 +53,8 @@ def analyze(rows: list[dict], k_values: list[int], metrics: list[str]) -> dict[s
     for row in rows:
         qid = row.get("query_id")
         if qid is None:
+            continue
+        if qid in EXCLUDED_QUERY_IDS:
             continue
         style = query_style(int(qid))
         retrieved = row.get("retrieved_ids", [])

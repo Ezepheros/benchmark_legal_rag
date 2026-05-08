@@ -31,7 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from benchmark_rag.evaluation.metrics import evaluate_retrieval
+from benchmark_rag.evaluation.metrics import evaluate_retrieval, EXCLUDED_QUERY_IDS
 
 ALL_METRICS = ["recall_at_k", "doc_recall_at_k", "precision_at_k", "hit_at_k", "mrr", "ndcg_at_k"]
 
@@ -74,6 +74,10 @@ def main():
     if not rows:
         sys.exit("ERROR: results file is empty.")
 
+    rows = [r for r in rows
+            if r.get("query_id") not in EXCLUDED_QUERY_IDS
+            and r.get("gold_citations")]
+
     retrieved_lists = [r["retrieved_ids"] for r in rows]
     relevant_sets   = [set(r["gold_citations"]) for r in rows]
 
@@ -82,7 +86,7 @@ def main():
         k_values = sorted(args.k)
     else:
         max_retrieved = max(len(r) for r in retrieved_lists)
-        k_values = sorted(k for k in [3, 5, 10, 20, 50, 100] if k <= max_retrieved)
+        k_values = sorted(k for k in [3, 5, 10, 25, 50] if k <= max_retrieved)
         if not k_values:
             k_values = [max_retrieved]
         print(f"Inferred k_values from data: {k_values}")

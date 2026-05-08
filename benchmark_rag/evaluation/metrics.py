@@ -17,6 +17,25 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+EXCLUDED_QUERY_IDS: set[int] = {
+    342, 343,
+    1488, 1489, 1490, 1491, 1492, 1493, 1494, 1495,
+    1496, 1497, 1498, 1499, 1500, 1501, 1502, 1503,
+}
+
+ALL_METRICS = ["recall_at_k", "doc_recall_at_k", "precision_at_k", "hit_at_k", "mrr", "ndcg_at_k"]
+
+
+def is_query_usable(q: dict) -> bool:
+    """Return True if a query has both a non-empty answer and ground-truth citations."""
+    if q.get("query_id") in EXCLUDED_QUERY_IDS:
+        return False
+    if not q.get("ground_truth_citations"):
+        return False
+    if not str(q.get("user_answer", "")).strip():
+        return False
+    return True
+
 
 # ---------------------------------------------------------------------------
 # Per-query metric computation

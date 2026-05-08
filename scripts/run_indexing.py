@@ -195,8 +195,16 @@ def main():
     log.info(f"Loaded {len(documents)} documents from {cfg.dataset.path}")
 
     pipeline = IndexingPipeline(cfg, force_reindex=args.force_reindex)
-    output_dir = pipeline.run(documents)
-    log.info(f"Indexing complete. Output: {output_dir}")
+    try:
+        output_dir = pipeline.run(documents)
+    except Exception as exc:
+        from benchmark_rag.components.base import BudgetExceededError
+        if isinstance(exc, BudgetExceededError):
+            log.warning(f"Budget exceeded during indexing — saving partial results. {exc}")
+        else:
+            raise
+    else:
+        log.info(f"Indexing complete. Output: {output_dir}")
 
     run_cost = sum_component_costs(pipeline)
     total, csv_path = append_cost_entry(

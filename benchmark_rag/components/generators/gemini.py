@@ -6,12 +6,36 @@ Uses the google-genai SDK (google.genai), the successor to google-generativeai.
 from __future__ import annotations
 
 import logging
+import time
 
 from benchmark_rag.components.base import BaseGenerator, RetrievedChunk
 from benchmark_rag.prompts.answer_generator import ANSWER_SYSTEM_PROMPT
 from benchmark_rag.prompts.judge import JUDGE_SYSTEM_PROMPT
 
 log = logging.getLogger(__name__)
+
+_RETRY_DELAYS = [5, 10, 30, 60, 120]  # initial backoff; after exhausted, repeats 120s forever
+
+
+def _generate_with_retry(client, **kwargs):
+    """Call models.generate_content with infinite retry on 429/503."""
+    from google.genai.errors import ClientError, ServerError
+
+    attempt = 0
+    while True:
+        try:
+            return client.models.generate_content(**kwargs)
+        except (ClientError, ServerError) as e:
+            code = getattr(e, "code", None)
+            if code not in (429, 503):
+                raise
+            delay = _RETRY_DELAYS[attempt] if attempt < len(_RETRY_DELAYS) else _RETRY_DELAYS[-1]
+            attempt += 1
+            log.warning(
+                "Gemini %d %s — retrying in %ds (attempt %d)...",
+                code, type(e).__name__, delay, attempt,
+            )
+            time.sleep(delay)
 
 # Per-token pricing in USD. Update when Gemini pricing changes.
 # Source: https://ai.google.dev/pricing
@@ -121,7 +145,8 @@ class GeminiGenerator(BaseGenerator):
         self._load()
         context = _build_context(context_chunks)
         prompt = f"Context:\n{context}\n\nQuestion: {query}"
-        response = self._client.models.generate_content(  # type: ignore[union-attr]
+        response = _generate_with_retry(
+            self._client,
             model=self.model_name,
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -204,7 +229,8 @@ class GeminiJudge:
             f"Generated answer: {generated_answer}\n\n"
             f"Reference answer: {reference_answer}"
         )
-        response = self._client.models.generate_content(  # type: ignore[union-attr]
+        response = _generate_with_retry(
+            self._client,
             model=self.model_name,
             contents=prompt,
             config=types.GenerateContentConfig(

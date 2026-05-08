@@ -84,6 +84,9 @@ class AgenticConfig(BaseModel):
     max_k_per_search: int = 10       # upper bound on k per single keyword_search call
     max_doc_chunks: int = 15         # upper bound on chunks returned by a single get_document call
     model_name: str = "gemini-2.5-flash"
+    max_cost_usd: float | None = 15.0  # budget cap for the entire run; None = no limit
+    target_saved_docs: int = 25      # keep searching until this many docs are saved
+    min_docs_per_iter: int = 4       # force-save top BM25 results if agent saves fewer
 
 
 # ---------------------------------------------------------------------------

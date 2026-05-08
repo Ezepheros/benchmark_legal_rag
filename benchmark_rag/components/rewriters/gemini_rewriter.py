@@ -13,7 +13,7 @@ from benchmark_rag.prompts.query_rewriter import REWRITER_SYSTEM_PROMPT as _SYST
 
 log = logging.getLogger(__name__)
 
-_RETRY_DELAYS = [5, 10, 30, 60, 120]  # seconds between attempts
+_RETRY_DELAYS = [5, 10, 30, 60, 120]  # initial backoff; after exhausted, repeats 120s forever
 
 
 def _get_api_key(api_key: str | None) -> str:
@@ -66,19 +66,17 @@ class GeminiQueryRewriter:
         self._client = genai.Client(api_key=_get_api_key(self._api_key))
 
     def rewrite(self, query: str) -> str:
-        """Return the query rephrased in legal language, retrying on 503 errors."""
+        """Return the query rephrased in legal language, retrying on 429/503."""
         from google.genai import types
-        from google.genai.errors import ServerError
+        from google.genai.errors import ClientError, ServerError
         self._load()
         config = types.GenerateContentConfig(
             system_instruction=_SYSTEM_PROMPT,
             temperature=self.temperature,
             max_output_tokens=self.max_output_tokens,
         )
-        for attempt, delay in enumerate([0] + _RETRY_DELAYS):
-            if delay:
-                log.warning("Gemini 503 — retrying in %ds (attempt %d/%d)...", delay, attempt, len(_RETRY_DELAYS) + 1)
-                time.sleep(delay)
+        attempt = 0
+        while True:
             try:
                 response = self._client.models.generate_content(  # type: ignore[union-attr]
                     model=self.model_name,
@@ -86,9 +84,17 @@ class GeminiQueryRewriter:
                     config=config,
                 )
                 break
-            except ServerError as e:
-                if e.code != 503 or attempt == len(_RETRY_DELAYS):
+            except (ClientError, ServerError) as e:
+                code = getattr(e, "code", None)
+                if code not in (429, 503):
                     raise
+                delay = _RETRY_DELAYS[attempt] if attempt < len(_RETRY_DELAYS) else _RETRY_DELAYS[-1]
+                attempt += 1
+                log.warning(
+                    "Gemini %d %s — retrying in %ds (attempt %d)...",
+                    code, type(e).__name__, delay, attempt,
+                )
+                time.sleep(delay)
         usage = response.usage_metadata
         self._call_count += 1
         self._total_input_tokens += usage.prompt_token_count

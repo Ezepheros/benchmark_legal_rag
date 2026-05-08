@@ -1,29 +1,24 @@
 """
 Agentic RAG pipeline: a Gemini LLM drives iterative keyword search over a
-BM25 index, explicitly curating relevant documents before synthesising a
-final answer.
+BM25 index, curating relevant documents before synthesising a final answer.
 
-The agent alternates between two phases each iteration:
+Each iteration has two phases plus an enforcement step:
 
-  Search phase  — tools: keyword_search, answer
-    The agent searches for cases using BM25 keywords, or calls answer()
-    if it already has enough saved documents.
+  Search phase  — the agent chooses a keyword_search query.
+  Review phase  — the agent chooses which citations to save.
+  Enforcement   — if the agent saved fewer than min_docs_per_iter, the top
+                  BM25 results from that search are auto-saved.
 
-  Review phase  — tools: save_citations, answer
-    After seeing the search results, the agent saves the relevant citations
-    (with search-term provenance) or calls answer() to stop searching.
+The loop runs until target_saved_docs documents are saved or max_iterations
+is reached — the agent cannot call answer() early.
 
-Each save_citations response includes a full state summary (saved documents +
-queries run so far), giving the agent full context before the next search.
+After citations are saved, a summarize call produces a short summary of each
+newly saved document.  These summaries form the agent's memory for subsequent
+iterations, keeping input tokens bounded.
 
-Three tools:
-  keyword_search(query, k)   BM25 search; available in search phase only.
-  save_citations(citations)  Save relevant citations; available in review phase only.
-  answer()                   Exit signal; available in both phases.
-
-When answer() is called (or max_iterations is exhausted), a separate final-
-answer generation step is performed with all saved document chunks as context
-and no tools.
+When the loop exits, saved chunks are re-scored against the original query
+via BM25 and returned in descending relevance order, consistent with the
+dense and hybrid retrieval pipelines.
 
 Usage
 -----
@@ -36,11 +31,12 @@ Requires a pre-built BM25 index (run run_indexing.py first).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from benchmark_rag.components.base import EmbeddedChunk, RetrievedChunk
-from benchmark_rag.components.retrievers.bm25_retriever import BM25Retriever
+from benchmark_rag.components.generators.gemini import _generate_with_retry
+from benchmark_rag.components.retrievers.bm25_retriever import BM25Retriever, _tokenize
 from benchmark_rag.config.schemas import ExperimentConfig
 from benchmark_rag.logging import get_logger
 from benchmark_rag.pipeline.rag_pipeline import QueryResult
@@ -48,6 +44,8 @@ from benchmark_rag.prompts.agentic import (
     ANSWER_SYSTEM_PROMPT as _ANSWER_SYSTEM_PROMPT,
     REVIEW_SYSTEM_PROMPT as _REVIEW_SYSTEM_PROMPT,
     SEARCH_SYSTEM_PROMPT as _SEARCH_SYSTEM_PROMPT,
+    SUMMARIZE_INSTRUCTION as _SUMMARIZE_INSTRUCTION,
+    SUMMARIZE_SYSTEM_PROMPT as _SUMMARIZE_SYSTEM_PROMPT,
 )
 
 log = logging.getLogger(__name__)
@@ -57,11 +55,19 @@ _PRICING: dict[str, tuple[float, float]] = {
     "gemini-2.5-pro":   (1.25 / 1_000_000, 10.0 / 1_000_000),
 }
 
+
+_DOC_PREFIX_CHARS = 10_000
+
+
 @dataclass
 class _SavedDoc:
     citation: str
-    search_query: str       # the keyword_search query that led to saving this document
+    title: str
+    search_query: str
     chunks: list[RetrievedChunk]
+    doc_prefix: str = ""       # first 10k chars of the document (or full text if short)
+    is_short_doc: bool = False # True when full doc text fits in the prefix
+    summary: str = ""
 
 
 def _estimate_cost(model_name: str, in_tok: int, out_tok: int) -> float | None:
@@ -83,25 +89,16 @@ def _format_chunks(chunks: list[RetrievedChunk], show_score: bool = True) -> str
 
 class AgenticRAGPipeline:
     """
-    RAG pipeline where a Gemini LLM alternates between a search phase and a
-    review phase to iteratively curate relevant documents from a BM25 index
-    before synthesising a final answer.
+    RAG pipeline where a Gemini LLM drives iterative BM25 search and document
+    curation before synthesising a final answer.
 
-    Parameters
-    ----------
-    retriever:
-        Pre-loaded BM25Retriever.
-    model_name:
-        Gemini model ID used for all agent calls and the final answer.
-    max_iterations:
-        Hard cap on search→review iteration rounds.  If the LLM has not
-        called answer() by this point, final answer generation is forced.
-    max_k_per_search:
-        Upper bound on k for a single keyword_search call.
-    max_doc_chunks:
-        Upper bound on chunks loaded per saved document (get_document style).
-    api_key:
-        Google API key.  Falls back to GOOGLE_API_KEY / GEMINI_API_KEY env vars.
+    The agent searches and saves documents each iteration until
+    ``target_saved_docs`` are collected or ``max_iterations`` is reached.
+    If the agent saves fewer than ``min_docs_per_iter`` in an iteration,
+    the top BM25 results are auto-saved to ensure progress.
+
+    After the loop, all saved chunks are re-scored against the original query
+    via BM25 and returned in descending score order.
     """
 
     def __init__(
@@ -111,6 +108,9 @@ class AgenticRAGPipeline:
         max_iterations: int = 5,
         max_k_per_search: int = 10,
         max_doc_chunks: int = 15,
+        max_cost_usd: float | None = 15.0,
+        target_saved_docs: int = 25,
+        min_docs_per_iter: int = 4,
         api_key: str | None = None,
     ):
         self.retriever = retriever
@@ -118,6 +118,9 @@ class AgenticRAGPipeline:
         self._max_iterations = max_iterations
         self._max_k_per_search = max_k_per_search
         self._max_doc_chunks = max_doc_chunks
+        self._max_cost_usd = max_cost_usd
+        self._target_saved_docs = target_saved_docs
+        self._min_docs_per_iter = min_docs_per_iter
         self._api_key = api_key
         self._client = None
         self._doc_chunks: dict[str, list[EmbeddedChunk]] = {}
@@ -154,7 +157,9 @@ class AgenticRAGPipeline:
             )
         self._client = genai.Client(api_key=key)
 
-    def _track_and_log(self, in_tok: int, out_tok: int) -> None:
+    def _track_and_log(self, in_tok: int | None, out_tok: int | None) -> None:
+        in_tok = in_tok or 0
+        out_tok = out_tok or 0
         cost = _estimate_cost(self._model_name, in_tok, out_tok)
         self._call_count += 1
         self._total_input_tokens += in_tok
@@ -169,6 +174,11 @@ class AgenticRAGPipeline:
             self._total_input_tokens, self._total_output_tokens,
             f"${self._total_cost:.6f}" if self._total_cost is not None else "N/A",
         )
+
+    def _budget_exceeded(self) -> bool:
+        if self._max_cost_usd is None:
+            return False
+        return (self._total_cost or 0.0) >= self._max_cost_usd
 
     def log_usage_summary(self) -> None:
         self.log.info(
@@ -198,10 +208,10 @@ class AgenticRAGPipeline:
         citations: list[str],
         search_query: str,
         saved_docs: dict[str, _SavedDoc],
-    ) -> str:
+    ) -> tuple[str, list[str]]:
         """
         Record citations as relevant, loading their chunks from the BM25 index.
-        Skips citations already saved.  Returns a confirmation string.
+        Returns (confirmation_message, list_of_newly_saved_citations).
         """
         saved_new: list[str] = []
         not_found: list[str] = []
@@ -228,10 +238,20 @@ class AgenticRAGPipeline:
                 )
                 for c in raw[: self._max_doc_chunks]
             ]
+            title = chunks[0].metadata.get("name", "") if chunks else ""
+
+            # Build document prefix from ALL chunks (not just max_doc_chunks)
+            full_text = "\n\n".join(c.text for c in raw)
+            is_short = len(full_text) <= _DOC_PREFIX_CHARS
+            doc_prefix = full_text if is_short else full_text[:_DOC_PREFIX_CHARS]
+
             saved_docs[citation] = _SavedDoc(
                 citation=citation,
+                title=title,
                 search_query=search_query,
                 chunks=chunks,
+                doc_prefix=doc_prefix,
+                is_short_doc=is_short,
             )
             saved_new.append(citation)
 
@@ -246,7 +266,36 @@ class AgenticRAGPipeline:
             parts.append(
                 "No new citations saved (all were already saved or list was empty)."
             )
-        return " ".join(parts)
+        return " ".join(parts), saved_new
+
+    # ------------------------------------------------------------------
+    # Summarization
+    # ------------------------------------------------------------------
+
+    def _summarize_document(self, query_text: str, doc: _SavedDoc) -> str:
+        """Generate a concise summary of a saved document and its query relevance."""
+        from google.genai import types
+
+        doc_text = self._format_doc_text(doc)
+        prompt = (
+            f"QUESTION: {query_text}\n\n"
+            f"DOCUMENT [{doc.citation}] — {doc.title}\n\n"
+            f"{doc_text}\n\n"
+            f"{_SUMMARIZE_INSTRUCTION}"
+        )
+
+        response = _generate_with_retry(self._client,  # type: ignore[union-attr]
+            model=self._model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=_SUMMARIZE_SYSTEM_PROMPT,
+                temperature=0.0,
+                max_output_tokens=1024,
+            ),
+        )
+        usage = response.usage_metadata
+        self._track_and_log(usage.prompt_token_count, usage.candidates_token_count)
+        return response.text or ""
 
     # ------------------------------------------------------------------
     # State formatting helpers
@@ -257,10 +306,7 @@ class AgenticRAGPipeline:
         saved_docs: dict[str, _SavedDoc],
         searches_run: list[str],
     ) -> str:
-        """
-        Compact state summary injected into save_citations responses so the
-        agent has full context before choosing the next search.
-        """
+        """Compact research state shown to the agent each iteration."""
         lines: list[str] = ["=== Research State ==="]
 
         if searches_run:
@@ -273,9 +319,13 @@ class AgenticRAGPipeline:
         if saved_docs:
             lines.append(f"\nSaved documents ({len(saved_docs)}):")
             for doc in saved_docs.values():
-                lines.append(f"\n[{doc.citation}]  (found via: \"{doc.search_query}\")")
-                # Show first chunk truncated so the agent can remember what each doc is
-                if doc.chunks:
+                lines.append(
+                    f"\n[{doc.citation}] {doc.title}  "
+                    f"(found via: \"{doc.search_query}\")"
+                )
+                if doc.summary:
+                    lines.append(doc.summary)
+                elif doc.chunks:
                     snippet = doc.chunks[0].text[:300].replace("\n", " ")
                     lines.append(f"  {snippet}...")
         else:
@@ -283,14 +333,55 @@ class AgenticRAGPipeline:
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _format_doc_text(doc: _SavedDoc) -> str:
+        """Format a saved document for LLM context.
+
+        Short docs (full text <= 10k chars): just the full text.
+        Long docs: the 10k-char prefix followed by the saved chunks.
+        """
+        if doc.is_short_doc:
+            return doc.doc_prefix
+        parts = [
+            f"--- Document overview (first {_DOC_PREFIX_CHARS:,d} chars) ---",
+            doc.doc_prefix,
+            "--- Relevant chunks ---",
+            _format_chunks(doc.chunks, show_score=False),
+        ]
+        return "\n\n".join(parts)
+
     def _format_saved_for_answer(self, saved_docs: dict[str, _SavedDoc]) -> str:
-        """Full chunk text for all saved documents, used in the final answer call."""
+        """Full document context for all saved documents, used in the final answer call."""
         parts: list[str] = []
         for doc in saved_docs.values():
-            header = f"=== {doc.citation} (found via: \"{doc.search_query}\") ==="
-            body = _format_chunks(doc.chunks, show_score=False)
+            header = f"=== {doc.citation} — {doc.title} ==="
+            body = self._format_doc_text(doc)
             parts.append(f"{header}\n{body}")
         return "\n\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Final ranking
+    # ------------------------------------------------------------------
+
+    def _rank_saved_chunks(
+        self, query_text: str, saved_docs: dict[str, _SavedDoc],
+    ) -> list[RetrievedChunk]:
+        """Re-score all saved chunks by BM25 relevance to the original query."""
+        all_scores = self.retriever._bm25.get_scores(_tokenize(query_text))
+
+        chunk_to_idx: dict[tuple[str, int], int] = {}
+        for i, c in enumerate(self.retriever._chunks):
+            chunk_to_idx[(c.doc_id, c.chunk_idx)] = i
+
+        ranked: list[RetrievedChunk] = []
+        for doc in saved_docs.values():
+            for chunk in doc.chunks:
+                idx = chunk_to_idx.get((chunk.doc_id, chunk.chunk_idx))
+                chunk.score = float(all_scores[idx]) if idx is not None else 0.0
+                ranked.append(chunk)
+
+        ranked.sort(key=lambda c: c.score, reverse=True)
+        return ranked
 
     # ------------------------------------------------------------------
     # Factory
@@ -298,14 +389,6 @@ class AgenticRAGPipeline:
 
     @classmethod
     def from_config(cls, cfg: ExperimentConfig) -> "AgenticRAGPipeline":
-        """
-        Build an AgenticRAGPipeline from an ExperimentConfig.
-
-        Loads the BM25 index from cfg.indexing.output_dir.  The index must
-        have been built by run_indexing.py using a HybridRetriever or
-        BM25Retriever config with matching dataset + chunker + embedder
-        settings (same index_id).
-        """
         assert cfg.agentic is not None, (
             "AgenticRAGPipeline requires an 'agentic:' section in the experiment config."
         )
@@ -319,6 +402,9 @@ class AgenticRAGPipeline:
             max_iterations=cfg.agentic.max_iterations,
             max_k_per_search=cfg.agentic.max_k_per_search,
             max_doc_chunks=cfg.agentic.max_doc_chunks,
+            max_cost_usd=cfg.agentic.max_cost_usd,
+            target_saved_docs=cfg.agentic.target_saved_docs,
+            min_docs_per_iter=cfg.agentic.min_docs_per_iter,
         )
 
     # ------------------------------------------------------------------
@@ -329,24 +415,23 @@ class AgenticRAGPipeline:
         """
         Run the agentic search loop for one query.
 
-        Alternates between search phase (keyword_search | answer) and review
-        phase (save_citations | answer) for up to max_iterations rounds.
-        When answer() is called or iterations are exhausted, a separate final-
-        answer generation call synthesises the answer from all saved chunks.
+        The agent searches and saves documents every iteration until
+        target_saved_docs are collected or max_iterations is reached.
+        If the agent saves fewer than min_docs_per_iter, the top BM25
+        results from that search are auto-saved.
 
-        Returns a QueryResult where retrieved_chunks is the ordered union of
-        all saved document chunks (save order, chunk order within each doc).
+        After the loop, all saved chunks are re-scored against the original
+        query via BM25 and returned in descending relevance order.
         """
         from google.genai import types
 
         self._load_client()
 
-        # Per-query mutable state
-        saved_docs: dict[str, _SavedDoc] = {}   # citation → _SavedDoc
+        target = self._target_saved_docs
+        saved_docs: dict[str, _SavedDoc] = {}
         searches_run: list[str] = []
-        last_search_query: str = ""
 
-        # ---- Tool declarations ----------------------------------------
+        # ---- Tool declarations (no answer tool) --------------------------
         keyword_search_decl = types.FunctionDeclaration(
             name="keyword_search",
             description=(
@@ -376,8 +461,8 @@ class AgenticRAGPipeline:
             name="save_citations",
             description=(
                 "Save citations identified as relevant from the last search. "
-                "Saved documents (with the search query that found them) will be shown "
-                "at the start of your next search."
+                "Saved documents will be summarized and shown in your research "
+                "state for subsequent searches."
             ),
             parameters=types.Schema(
                 type=types.Type.OBJECT,
@@ -393,154 +478,204 @@ class AgenticRAGPipeline:
                 required=["citations"],
             ),
         )
-        answer_decl = types.FunctionDeclaration(
-            name="answer",
-            description=(
-                "Stop searching and generate the final answer from your saved documents."
-            ),
-            parameters=types.Schema(
-                type=types.Type.OBJECT,
-                properties={},
-            ),
-        )
 
-        all_tools = types.Tool(
-            function_declarations=[keyword_search_decl, save_citations_decl, answer_decl]
-        )
+        search_tools = types.Tool(function_declarations=[keyword_search_decl])
+        review_tools = types.Tool(function_declarations=[save_citations_decl])
 
-        # ---- Phase configs (differ only in allowed_function_names) ----
         search_cfg = types.GenerateContentConfig(
             system_instruction=_SEARCH_SYSTEM_PROMPT,
-            tools=[all_tools],
+            tools=[search_tools],
             tool_config=types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(
                     mode="ANY",
-                    allowed_function_names=["keyword_search", "answer"],
+                    allowed_function_names=["keyword_search"],
                 )
             ),
             temperature=0.0,
         )
         review_cfg = types.GenerateContentConfig(
             system_instruction=_REVIEW_SYSTEM_PROMPT,
-            tools=[all_tools],
+            tools=[review_tools],
             tool_config=types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(
                     mode="ANY",
-                    allowed_function_names=["save_citations", "answer"],
+                    allowed_function_names=["save_citations"],
                 )
             ),
             temperature=0.0,
         )
 
-        contents: list[types.Content] = [
-            types.Content(role="user", parts=[types.Part(text=query_text)])
-        ]
-
-        done = False
         n_iterations = 0
 
         for n_iterations in range(1, self._max_iterations + 1):
 
-            # ---- Search phase -----------------------------------------
-            response = self._client.models.generate_content(  # type: ignore[union-attr]
+            if len(saved_docs) >= target:
+                self.log.info(
+                    "AgenticRAGPipeline: target %d docs reached (%d saved) "
+                    "— stopping search loop",
+                    target, len(saved_docs),
+                )
+                break
+
+            if self._budget_exceeded():
+                self.log.warning(
+                    "AgenticRAGPipeline: budget cap $%.2f reached "
+                    "(spent $%.6f) — stopping search loop",
+                    self._max_cost_usd, self._total_cost or 0.0,
+                )
+                break
+
+            # ---- Search phase (fresh prompt) -----------------------------
+            state_text = self._format_state(saved_docs, searches_run)
+            search_prompt = (
+                f"Question: {query_text}\n\n"
+                f"{state_text}\n\n"
+                f"You need to find {target - len(saved_docs)} more document(s). "
+                f"Choose your next search."
+            )
+
+            response = _generate_with_retry(self._client,  # type: ignore[union-attr]
                 model=self._model_name,
-                contents=contents,
+                contents=search_prompt,
                 config=search_cfg,
             )
             usage = response.usage_metadata
             self._track_and_log(usage.prompt_token_count, usage.candidates_token_count)
 
-            candidate = response.candidates[0].content
-            contents.append(candidate)
-
+            candidate = response.candidates[0].content if response.candidates else None
+            if candidate is None or not getattr(candidate, "parts", None):
+                finish = getattr(response.candidates[0], "finish_reason", "UNKNOWN") if response.candidates else "NO_CANDIDATES"
+                self.log.warning(
+                    "AgenticRAGPipeline: empty response in search phase "
+                    "(iteration=%d, finish_reason=%s) — skipping to next iteration",
+                    n_iterations, finish,
+                )
+                continue
             fc = next((p.function_call for p in candidate.parts if p.function_call), None)
-            if fc is None or fc.name == "answer":
-                self.log.info(
-                    "AgenticRAGPipeline: answer() in search phase — iteration=%d",
+            if fc is None:
+                self.log.warning(
+                    "AgenticRAGPipeline: no function call in search phase "
+                    "(iteration=%d) — skipping to next iteration",
                     n_iterations,
                 )
-                done = True
-                break
+                continue
 
-            # Execute keyword_search
             search_query = str(fc.args.get("query", ""))
             k_req = int(fc.args.get("k", self._max_k_per_search))
-            result_text, _ = self._keyword_search(search_query, k_req)
-            last_search_query = search_query
+            result_text, search_chunks = self._keyword_search(search_query, k_req)
             searches_run.append(search_query)
 
             self.log.debug(
                 "AgenticRAGPipeline iteration=%d search=%r", n_iterations, search_query
             )
 
-            contents.append(types.Content(
-                role="user",
-                parts=[types.Part(
-                    function_response=types.FunctionResponse(
-                        name="keyword_search",
-                        response={"result": result_text},
-                    )
-                )],
-            ))
+            if not search_chunks:
+                self.log.debug(
+                    "AgenticRAGPipeline iteration=%d: no search results", n_iterations
+                )
+                continue
 
-            # ---- Review phase -----------------------------------------
-            response = self._client.models.generate_content(  # type: ignore[union-attr]
+            if self._budget_exceeded():
+                self.log.warning(
+                    "AgenticRAGPipeline: budget cap reached after search — "
+                    "stopping (iteration=%d)", n_iterations,
+                )
+                break
+
+            # ---- Review phase (fresh prompt) -----------------------------
+            review_prompt = (
+                f"Question: {query_text}\n\n"
+                f"SEARCH RESULTS for \"{search_query}\":\n{result_text}\n\n"
+                f"{state_text}"
+            )
+
+            response = _generate_with_retry(self._client,  # type: ignore[union-attr]
                 model=self._model_name,
-                contents=contents,
+                contents=review_prompt,
                 config=review_cfg,
             )
             usage = response.usage_metadata
             self._track_and_log(usage.prompt_token_count, usage.candidates_token_count)
 
-            candidate = response.candidates[0].content
-            contents.append(candidate)
-
-            fc = next((p.function_call for p in candidate.parts if p.function_call), None)
-            if fc is None or fc.name == "answer":
-                self.log.info(
-                    "AgenticRAGPipeline: answer() in review phase — iteration=%d",
-                    n_iterations,
+            candidate = response.candidates[0].content if response.candidates else None
+            fc = None
+            if candidate is not None and getattr(candidate, "parts", None):
+                fc = next((p.function_call for p in candidate.parts if p.function_call), None)
+            else:
+                finish = getattr(response.candidates[0], "finish_reason", "UNKNOWN") if response.candidates else "NO_CANDIDATES"
+                self.log.warning(
+                    "AgenticRAGPipeline: empty response in review phase "
+                    "(iteration=%d, finish_reason=%s) — falling through to auto-save",
+                    n_iterations, finish,
                 )
-                done = True
-                break
 
-            # Execute save_citations
-            raw_citations: list[str] = list(fc.args.get("citations", []))
-            confirm_text = self._save_citations(raw_citations, last_search_query, saved_docs)
+            newly_saved: list[str] = []
+            if fc is not None:
+                raw_citations: list[str] = list(fc.args.get("citations", []))
+                confirm_text, newly_saved = self._save_citations(
+                    raw_citations, search_query, saved_docs,
+                )
+                self.log.debug(
+                    "AgenticRAGPipeline iteration=%d save_citations=%r — %s",
+                    n_iterations, raw_citations, confirm_text,
+                )
 
-            # Append state summary to the tool response so the agent has full
-            # context before deciding what to search next.
-            state_text = self._format_state(saved_docs, searches_run)
-            full_response = f"{confirm_text}\n\n{state_text}"
-
-            self.log.debug(
-                "AgenticRAGPipeline iteration=%d save_citations=%r — %s",
-                n_iterations, raw_citations, confirm_text,
-            )
-
-            contents.append(types.Content(
-                role="user",
-                parts=[types.Part(
-                    function_response=types.FunctionResponse(
-                        name="save_citations",
-                        response={"result": full_response},
+            # ---- Auto-save enforcement -----------------------------------
+            room = target - len(saved_docs)
+            needed = min(self._min_docs_per_iter, room) - len(newly_saved)
+            if needed > 0:
+                seen: set[str] = set()
+                auto_candidates: list[str] = []
+                for chunk in search_chunks:
+                    if chunk.doc_id not in seen and chunk.doc_id not in saved_docs:
+                        auto_candidates.append(chunk.doc_id)
+                        seen.add(chunk.doc_id)
+                if auto_candidates:
+                    auto_msg, auto_saved = self._save_citations(
+                        auto_candidates[:needed], search_query, saved_docs,
                     )
-                )],
-            ))
+                    newly_saved.extend(auto_saved)
+                    self.log.debug(
+                        "AgenticRAGPipeline iteration=%d auto-saved %d doc(s): %s",
+                        n_iterations, len(auto_saved), auto_msg,
+                    )
 
-        if not done:
-            self.log.info(
-                "AgenticRAGPipeline: max_iterations=%d reached — forcing final answer",
-                self._max_iterations,
-            )
+            # ---- Summarize newly saved documents -------------------------
+            for citation in newly_saved:
+                doc = saved_docs[citation]
+                if self._budget_exceeded():
+                    self.log.warning(
+                        "AgenticRAGPipeline: budget cap reached — skipping "
+                        "summary for %s", citation,
+                    )
+                    break
+                try:
+                    doc.summary = self._summarize_document(query_text, doc)
+                    self.log.debug(
+                        "AgenticRAGPipeline iteration=%d summarized %s (%d chars)",
+                        n_iterations, citation, len(doc.summary),
+                    )
+                except Exception:
+                    n_chunks = len(doc.chunks)
+                    total_chars = sum(len(c.text) for c in doc.chunks)
+                    self.log.exception(
+                        "AgenticRAGPipeline: failed to summarize %s "
+                        "(title=%r, n_chunks=%d, total_chars=%d, query=%r) "
+                        "— continuing with snippet fallback",
+                        citation, doc.title, n_chunks, total_chars,
+                        query_text[:200],
+                    )
 
-        # ---- Step 5: final answer generation (no tools) ---------------
+        self.log.info(
+            "AgenticRAGPipeline: search loop done | iterations=%d | saved_docs=%d",
+            n_iterations, len(saved_docs),
+        )
+
+        # ---- Final answer generation (no tools) --------------------------
         final_text = self._generate_final_answer(query_text, saved_docs)
 
-        # Flatten saved docs into retrieved_chunks in save order
-        retrieved_chunks: list[RetrievedChunk] = []
-        for doc in saved_docs.values():
-            retrieved_chunks.extend(doc.chunks)
+        # ---- Re-score and sort by BM25 relevance to original query -------
+        retrieved_chunks = self._rank_saved_chunks(query_text, saved_docs)
 
         self.log.info(
             "AgenticRAGPipeline: complete | iterations=%d | saved_docs=%d | "
@@ -574,7 +709,7 @@ class AgenticRAGPipeline:
 
         prompt = f"Question: {query_text}\n\n{context}"
 
-        response = self._client.models.generate_content(  # type: ignore[union-attr]
+        response = _generate_with_retry(self._client,  # type: ignore[union-attr]
             model=self._model_name,
             contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
             config=types.GenerateContentConfig(

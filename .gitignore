@@ -6,6 +6,12 @@ runs/
 
 # Data (symlink target is in its own repo)
 data/test_dataset
+*.jsonl
+*.json
+*.txt
+*.csv
+*.log
+*.jsonnd
 
 # Python
 __pycache__/
@@ -30,3 +36,4 @@ Thumbs.db
 # Secrets
 .env
 *.key
+benchmark_rag/components/decontextualizers/batch_output/embeddings/

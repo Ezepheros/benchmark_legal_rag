@@ -117,6 +117,9 @@ def main():
 
     for i, q in enumerate(selected, 1):
         qtext = str(q.get("query_text", ""))
+        province = q.get("province", "")
+        if province:
+            qtext = f"I am in {province}. {qtext}"
         gold = list(q.get("ground_truth_citations", []))
         print("=" * 72)
         print(f"[{i}/{len(selected)}] query_id={q.get('query_id')}")
