@@ -289,7 +289,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate answer generation with atomic-fact judging.")
     parser.add_argument("--config", required=True, help="Path to experiment YAML config")
     parser.add_argument("--k-values", type=int, nargs="+", default=[10, 25], help="k values to evaluate at (default: 10 25)")
-    parser.add_argument("--token-budget", type=int, default=128_000, help="Context token budget (default: 128000)")
+    parser.add_argument("--token-budget", type=int, default=115_000, help="Context token budget (default: 115000)")
     parser.add_argument("--atomic-facts-path", default="data/test_dataset/ground_truth_atomic_facts.json", help="Path to pre-computed ground-truth atomic facts")
     parser.add_argument("--generator-model", default="gemini-2.5-flash", help="Model for answer generation")
     parser.add_argument("--judge-model", default="gemini-2.5-pro", help="Model for atomic-fact judging")

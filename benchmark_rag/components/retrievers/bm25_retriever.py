@@ -47,17 +47,20 @@ def _tokenize(text: str) -> list[str]:
 
 class BM25Retriever(BaseRetriever):
     """
-    Sparse BM25L retriever.
+    Sparse BM25 retriever (BM25L or BM25Okapi).
 
     Parameters
     ----------
+    variant:
+        "L" (default) — BM25L with delta lower-bound on normalised TF.
+        "okapi" — standard BM25Okapi.
     k1:
         Term-frequency saturation parameter (default 1.5).
     b:
         Length-normalisation parameter (default 0.75).
     delta:
         BM25L lower-bound on normalised TF (default 0.5).
-        Prevents over-penalisation of long documents.
+        Only used when variant="L".
     index_level:
         "chunk" (default) — one BM25 entry per chunk.
         "document" — one BM25 entry per full document.  Requires passing
@@ -66,6 +69,7 @@ class BM25Retriever(BaseRetriever):
 
     def __init__(
         self,
+        variant: str = "L",
         k1: float = 1.5,
         b: float = 0.75,
         delta: float = 0.5,
@@ -73,6 +77,9 @@ class BM25Retriever(BaseRetriever):
     ):
         if index_level not in ("chunk", "document"):
             raise ValueError(f"index_level must be 'chunk' or 'document', got '{index_level}'")
+        if variant not in ("L", "okapi"):
+            raise ValueError(f"variant must be 'L' or 'okapi', got '{variant}'")
+        self.variant = variant
         self.k1 = k1
         self.b = b
         self.delta = delta
@@ -86,13 +93,19 @@ class BM25Retriever(BaseRetriever):
     # Index management
     # ------------------------------------------------------------------
 
+    def _make_bm25(self, tokenized_corpus: list[list[str]]):
+        if self.variant == "okapi":
+            from rank_bm25 import BM25Okapi
+            return BM25Okapi(tokenized_corpus, k1=self.k1, b=self.b)
+        else:
+            from rank_bm25 import BM25L
+            return BM25L(tokenized_corpus, k1=self.k1, b=self.b, delta=self.delta)
+
     def build_index(
         self,
         chunks: list[EmbeddedChunk],
         documents: list[Document] | None = None,
     ) -> None:
-        from rank_bm25 import BM25L
-
         self._chunks = chunks
 
         if self.index_level == "document":
@@ -104,15 +117,13 @@ class BM25Retriever(BaseRetriever):
             self._build_document_level(documents, chunks)
         else:
             tokenized_corpus = [_tokenize(c.text) for c in chunks]
-            self._bm25 = BM25L(tokenized_corpus, k1=self.k1, b=self.b, delta=self.delta)
+            self._bm25 = self._make_bm25(tokenized_corpus)
 
     def _build_document_level(
         self,
         documents: list[Document],
         chunks: list[EmbeddedChunk],
     ) -> None:
-        from rank_bm25 import BM25L
-
         self._doc_order = [d.doc_id for d in documents]
 
         lookup: dict[str, list[EmbeddedChunk]] = defaultdict(list)
@@ -123,7 +134,7 @@ class BM25Retriever(BaseRetriever):
         self._doc_chunk_lookup = dict(lookup)
 
         tokenized_corpus = [_tokenize(d.text) for d in documents]
-        self._bm25 = BM25L(tokenized_corpus, k1=self.k1, b=self.b, delta=self.delta)
+        self._bm25 = self._make_bm25(tokenized_corpus)
 
         log.info(
             "BM25 document-level index built: %d documents, %d chunks",

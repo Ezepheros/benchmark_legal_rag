@@ -94,13 +94,16 @@ def main():
     parser.add_argument("--b",  type=float, default=None, help="BM25 b parameter (overrides config)")
     parser.add_argument("--doc-level", action="store_true",
                         help="Index full documents instead of chunks (no FAISS index needed)")
+    parser.add_argument("--variant", choices=["L", "okapi"], default=None,
+                        help="BM25 variant: 'L' (default) or 'okapi'")
     args = parser.parse_args()
 
     cfg = ExperimentConfig.from_yaml(args.config)
 
-    # k1 / b: CLI arg wins; fall back to retriever config; then BM25 defaults
+    # k1 / b / variant: CLI arg wins; fall back to retriever config; then defaults
     k1 = args.k1 if args.k1 is not None else float(cfg.retriever.model_extra.get("k1", 1.5))
     b  = args.b  if args.b  is not None else float(cfg.retriever.model_extra.get("b",  0.75))
+    variant = args.variant or cfg.retriever.model_extra.get("variant", "L")
 
     setup_experiment_logging(
         experiment_id=cfg.experiment_id,
@@ -113,7 +116,7 @@ def main():
     log.info("=" * 60)
     log.info(f"EXPERIMENT : {cfg.experiment_id}")
     log.info(f"DESCRIPTION: {cfg.description}")
-    log.info(f"BM25 params: k1={k1}  b={b}  doc_level={args.doc_level}")
+    log.info(f"BM25 params: variant={variant}  k1={k1}  b={b}  doc_level={args.doc_level}")
     log.info(f"INDEX ID   : {cfg.index_id}")
     log.info("=" * 60)
 
@@ -126,8 +129,8 @@ def main():
             EmbeddedChunk(text=d.text, doc_id=d.doc_id, chunk_idx=0, metadata=d.metadata)
             for d in documents
         ]
-        log.info(f"Building document-level BM25 index (k1={k1}, b={b}) ...")
-        retriever = BM25Retriever(k1=k1, b=b, index_level="document")
+        log.info(f"Building document-level BM25 index (variant={variant}, k1={k1}, b={b}) ...")
+        retriever = BM25Retriever(variant=variant, k1=k1, b=b, index_level="document")
         retriever.build_index(chunks, documents=documents)
     else:
         # --- Chunk-level BM25: load chunks from existing FAISS index ---
@@ -139,8 +142,8 @@ def main():
         with open(chunks_path, "rb") as f:
             chunks = pickle.load(f)
         log.info(f"  {len(chunks)} chunks loaded.")
-        log.info(f"Building BM25 index (k1={k1}, b={b}) ...")
-        retriever = BM25Retriever(k1=k1, b=b)
+        log.info(f"Building BM25 index (variant={variant}, k1={k1}, b={b}) ...")
+        retriever = BM25Retriever(variant=variant, k1=k1, b=b)
         retriever.build_index(chunks)
 
     log.info("  Done.")

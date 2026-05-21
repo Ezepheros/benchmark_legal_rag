@@ -41,7 +41,7 @@ RESULTS_DIR = PROJECT_ROOT / "runs" / "multi_generator_50" / "results"
 RETRIEVAL_PATH = RESULTS_DIR / "shared_retrieval.jsonl"
 
 MAX_INPUT_TOKENS = 125_000
-CONTEXT_TOKEN_BUDGET = 120_000
+CONTEXT_TOKEN_BUDGET = 115_000
 CHARS_PER_TOKEN = 4
 MAX_INPUT_CHARS = MAX_INPUT_TOKENS * CHARS_PER_TOKEN
 
@@ -142,12 +142,16 @@ def generate_qwen(prompt: str, system_prompt: str, model, tokenizer) -> tuple[st
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
-    input_ids = tokenizer.apply_chat_template(
+    tokenized = tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=True,
         tokenize=True,
         return_tensors="pt",
-    ).to(model.device)
+    )
+    if hasattr(tokenized, "input_ids"):
+        input_ids = tokenized["input_ids"].to(model.device)
+    else:
+        input_ids = tokenized.to(model.device)
 
     input_len = input_ids.shape[-1]
     if input_len > MAX_INPUT_TOKENS:
@@ -216,7 +220,11 @@ def run_qwen_sanity_tests(model, tokenizer, retrieval_data: list[dict]) -> bool:
             else:
                 template_kwargs["enable_thinking"] = False
 
-            input_ids = tokenizer.apply_chat_template(messages, **template_kwargs).to(model.device)
+            tokenized = tokenizer.apply_chat_template(messages, **template_kwargs)
+            if hasattr(tokenized, "input_ids"):
+                input_ids = tokenized["input_ids"].to(model.device)
+            else:
+                input_ids = tokenized.to(model.device)
             input_len = input_ids.shape[-1]
 
             gen_kwargs = dict(max_new_tokens=500)
@@ -321,7 +329,7 @@ def _log_config(gen_name, retrieval_data, generator_obj=None):
         log.info(f"  CUDA version:         {torch.version.cuda}")
         log.info(f"  GPU count:            {torch.cuda.device_count()}")
         for i in range(torch.cuda.device_count()):
-            mem = torch.cuda.get_device_properties(i).total_mem / 1e9
+            mem = torch.cuda.get_device_properties(i).total_memory / 1e9
             log.info(f"  GPU {i}: {torch.cuda.get_device_name(i)} ({mem:.1f} GB)")
     log.info(f"  SLURM_JOB_ID:         {os.environ.get('SLURM_JOB_ID', 'not set')}")
     log.info(f"  SLURM_NODELIST:       {os.environ.get('SLURM_NODELIST', 'not set')}")
@@ -339,6 +347,8 @@ def main():
     parser = argparse.ArgumentParser(description="Generate answers with one generator.")
     parser.add_argument("--generator", required=True, choices=["gemini", "qwen", "gemma"],
                         help="Which generator to run")
+    parser.add_argument("--suffix", default="", help="Suffix for output file (e.g. _1gpu, _8bit)")
+    parser.add_argument("--quantize", choices=["8bit", "4bit"], default=None, help="Quantization for local models")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -371,14 +381,21 @@ def main():
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         model_name = "Qwen/Qwen3.5-9B"
-        log.info(f"Loading {model_name}...")
+        load_kwargs = {"device_map": "auto"}
+        if args.quantize == "8bit":
+            from transformers import BitsAndBytesConfig
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+            log.info(f"Loading {model_name} (8-bit)...")
+        elif args.quantize == "4bit":
+            from transformers import BitsAndBytesConfig
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
+            log.info(f"Loading {model_name} (4-bit)...")
+        else:
+            load_kwargs["torch_dtype"] = torch.bfloat16
+            log.info(f"Loading {model_name} (bfloat16)...")
         qwen_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        qwen_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-        )
-        log.info(f"Model loaded. device_map: {qwen_model.hf_device_map}")
+        qwen_model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+        log.info(f"Model loaded. device_map: {getattr(qwen_model, 'hf_device_map', 'N/A')}")
     elif gen_name == "gemma":
         from benchmark_rag.components.generators.gemma import GemmaGenerator
         generator_obj = GemmaGenerator(
@@ -391,7 +408,7 @@ def main():
     if gen_name == "qwen":
         run_qwen_sanity_tests(qwen_model, qwen_tokenizer, retrieval_data)
 
-    suffix = "_v2" if gen_name == "qwen" else ""
+    suffix = args.suffix
     output_file = RESULTS_DIR / f"{gen_name}{suffix}_answers.jsonl"
 
     # Load existing results for checkpointing

@@ -29,6 +29,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from benchmark_rag.evaluation.metrics import doc_recall_at_k, ndcg_at_k
+
 PROJECT_ROOT = Path(__file__).parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "test_dataset"
 RUNS_DIR = PROJECT_ROOT / "runs"
@@ -94,6 +96,7 @@ def compute_char_spans(doc_text: str, doc_chunks: list, retrieved_chunk_idxs: se
 
 def build_retrieval_info(query_id: int, method_name: str, experiment_id: str,
                           strat_ids: set, chunk_index: dict, doc_texts: dict,
+                          gold_citations: list[str],
                           top_k_docs: int = 10) -> dict | None:
     """Extract retrieval results for one method + one query."""
     results_file = RUNS_DIR / experiment_id / "results" / "query_results.jsonl"
@@ -107,16 +110,39 @@ def build_retrieval_info(query_id: int, method_name: str, experiment_id: str,
                 retrieved_ids = row.get("retrieved_ids", [])
                 unique_docs = list(dict.fromkeys(retrieved_ids))[:top_k_docs]
 
-                # Build per-document chunk spans
-                doc_spans = {}
                 chunk_details = row.get("retrieved_chunk_details", [])
+
+                # Build global rank lookup: (doc_id, chunk_idx) -> rank (0-based)
+                chunk_rank = {}
+                for rank, cd in enumerate(chunk_details):
+                    key = (cd.get("doc_id"), cd.get("chunk_idx"))
+                    if key not in chunk_rank:
+                        chunk_rank[key] = rank
+
+                # Build per-document chunk spans with global rank
+                doc_spans = {}
                 for did in unique_docs:
-                    chunk_idxs = {cd["chunk_idx"] for cd in chunk_details if cd.get("doc_id") == did}
+                    doc_chunk_details = [cd for cd in chunk_details if cd.get("doc_id") == did]
+                    chunk_idxs = {cd["chunk_idx"] for cd in doc_chunk_details}
+
                     if did in chunk_index and did in doc_texts:
-                        doc_spans[did] = compute_char_spans(doc_texts[did], chunk_index[did], chunk_idxs)
+                        spans = compute_char_spans(doc_texts[did], chunk_index[did], chunk_idxs)
+                        for span in spans:
+                            span["global_rank"] = chunk_rank.get((did, span["chunk_idx"]))
+                        doc_spans[did] = spans
                     elif chunk_idxs:
-                        doc_spans[did] = [{"chunk_idx": ci, "char_start": -1, "char_end": -1, "text_preview": ""}
-                                           for ci in sorted(chunk_idxs)]
+                        doc_spans[did] = [
+                            {"chunk_idx": ci, "char_start": -1, "char_end": -1,
+                             "text_preview": "", "global_rank": chunk_rank.get((did, ci))}
+                            for ci in sorted(chunk_idxs)
+                        ]
+
+                # Compute per-query metrics at k=10
+                relevant = set(gold_citations)
+                metrics = {
+                    "doc_recall_at_10": round(doc_recall_at_k(retrieved_ids, relevant, 10), 4),
+                    "ndcg_at_10": round(ndcg_at_k(retrieved_ids, relevant, 10), 4),
+                }
 
                 return {
                     "method": method_name,
@@ -124,6 +150,12 @@ def build_retrieval_info(query_id: int, method_name: str, experiment_id: str,
                     "num_chunks": len([rid for rid in retrieved_ids if rid in set(unique_docs)]),
                     "num_unique_docs": len(unique_docs),
                     "chunk_spans_by_doc": doc_spans,
+                    "chunk_details": [
+                        {"rank": i, "doc_id": cd["doc_id"], "chunk_idx": cd["chunk_idx"],
+                         "score": cd.get("score")}
+                        for i, cd in enumerate(chunk_details)
+                    ],
+                    "metrics": metrics,
                 }
     return None
 
@@ -309,7 +341,7 @@ def main():
         # Retrieval per method
         retrieval_methods = {}
         for method_name, experiment_id in RETRIEVAL_METHODS.items():
-            info = build_retrieval_info(qid, method_name, experiment_id, strat_ids, chunk_indexes.get(method_name, {}), doc_texts)
+            info = build_retrieval_info(qid, method_name, experiment_id, strat_ids, chunk_indexes.get(method_name, {}), doc_texts, gold_citations)
             if info:
                 retrieval_methods[method_name] = info
             else:

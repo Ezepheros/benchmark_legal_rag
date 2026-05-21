@@ -51,18 +51,20 @@ def recall_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:
 
 
 def doc_recall_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:
-    """Document-level recall: deduplicates retrieved doc_ids before counting (always in [0, 1])."""
+    """Document-level recall: take first k chunks, dedup to unique docs, count hits."""
     if not relevant:
         return 0.0
-    hits = len(set(retrieved[:k]) & relevant)
-    return hits / len(relevant)
+    docs_in_top_k = set(retrieved[:k])
+    return len(docs_in_top_k & relevant) / len(relevant)
 
 
 def precision_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:
+    """Document-level precision: take first k chunks, dedup, count hits / num unique docs."""
     if k == 0:
         return 0.0
-    hits = sum(1 for r in retrieved[:k] if r in relevant)
-    return hits / k
+    docs_in_top_k = list(dict.fromkeys(retrieved[:k]))
+    hits = sum(1 for d in docs_in_top_k if d in relevant)
+    return hits / len(docs_in_top_k) if docs_in_top_k else 0.0
 
 
 def hit_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:
@@ -70,13 +72,17 @@ def hit_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:
 
 
 def mrr(retrieved: list[str], relevant: set[str]) -> float:
-    for rank, r in enumerate(retrieved, start=1):
+    deduped = list(dict.fromkeys(retrieved))
+    for rank, r in enumerate(deduped, start=1):
         if r in relevant:
             return 1.0 / rank
     return 0.0
 
 
 def ndcg_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:
+    """nDCG over first k chunks, deduped to unique docs (preserving first-seen order)."""
+    docs_in_top_k = list(dict.fromkeys(retrieved[:k]))
+
     def dcg(items: list[str]) -> float:
         score = 0.0
         for i, item in enumerate(items, start=1):
@@ -84,8 +90,8 @@ def ndcg_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:
                 score += 1.0 / math.log2(i + 1)
         return score
 
-    actual_dcg = dcg(retrieved[:k])
-    ideal_items = list(relevant)[:k]
+    actual_dcg = dcg(docs_in_top_k)
+    ideal_items = list(relevant)[:len(docs_in_top_k)]
     ideal_dcg = dcg(ideal_items)
     return actual_dcg / ideal_dcg if ideal_dcg > 0 else 0.0
 
@@ -143,17 +149,11 @@ def evaluate_retrieval(
     n = len(retrieved_lists)
     assert n == len(relevant_sets), "retrieved_lists and relevant_sets must have the same length"
 
-    # Collapse chunk-level retrieved lists to document-level (unique doc_ids, first-occurrence rank).
-    # Pipelines return one entry per chunk, so the same doc_id may appear many times. Without this
-    # step NDCG can exceed 1.0 (multiple matching chunks each earn DCG credit) and precision is
-    # inflated (k slots are consumed by repeat doc_ids).
-    deduped_lists = [list(dict.fromkeys(ret)) for ret in retrieved_lists]
-
     scores: dict[str, dict[int, float]] = {}
 
     for metric in metric_names:
         if metric == "mrr":
-            vals = [mrr(ret, rel) for ret, rel in zip(deduped_lists, relevant_sets)]
+            vals = [mrr(ret, rel) for ret, rel in zip(retrieved_lists, relevant_sets)]
             scores["mrr"] = {-1: sum(vals) / n}
         else:
             scores[metric] = {}
@@ -170,7 +170,7 @@ def evaluate_retrieval(
                     fn = ndcg_at_k
                 else:
                     raise ValueError(f"Unknown metric: {metric}")
-                vals = [fn(ret, rel, k) for ret, rel in zip(deduped_lists, relevant_sets)]
+                vals = [fn(ret, rel, k) for ret, rel in zip(retrieved_lists, relevant_sets)]
                 scores[metric][k] = sum(vals) / n
 
     # Clean up mrr key (use 0 as a sentinel k)
